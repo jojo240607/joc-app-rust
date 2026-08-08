@@ -1,34 +1,19 @@
 //! 对 C 侧 device 接口的安全封装。Rust 应用经此操作驱动，不碰裸寄存器。
+//! 方案 Y 轻量版：所有系统调用经 `g_app_slot` 服务表（含 `dev_get`）；
+//! 不引用裸 `device_manager_get` 符号，故 App 可独立链接成应用分区镜像。
 //! 零成本：方法即直接转发 vtable 调用。
 
 use core::ffi::{c_char, c_void};
+use crate::abi::{deviceVtable, device_t, g_app_slot};
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct deviceVtable {
-    pub open: Option<extern "C" fn(*mut device) -> i32>,
-    pub close: Option<extern "C" fn(*mut device) -> i32>,
-    pub read: Option<extern "C" fn(*mut device, *mut c_void, usize) -> i32>,
-    pub write: Option<extern "C" fn(*mut device, *const c_void, usize) -> i32>,
-    pub ioctl: Option<extern "C" fn(*mut device, i32, *mut c_void) -> i32>,
-    pub irq_id: Option<extern "C" fn(*mut device) -> i32>,
-}
-
-#[repr(C)]
-pub struct device {
-    pub vtable: *const deviceVtable,
-    pub type_: u32,
-    pub name: *const c_char,
-    pub class_: u32,
-}
-
-/// 设备句柄：从 `device_manager_get` 拿到 `*mut device`，封装成类型安全 API。
+/// 设备句柄：从 `g_app_slot.dev_get` 拿到 `*mut device_t`，封装成类型安全 API。
 /// Copy：仅含裸指针，复制即复制句柄，无所有权负担。
 #[derive(Clone, Copy)]
-pub struct Device(*mut device);
+pub struct Device(*mut device_t);
 
 impl Device {
     /// 按名查找设备；返回 None 表示未注册。
+    /// 经服务表 dev_get（不引用裸 device_manager_get 符号，支持独立分区镜像）。
     pub fn get(name: &str) -> Option<Device> {
         let mut buf = [0u8; 32];
         if name.len() >= buf.len() {
@@ -36,7 +21,9 @@ impl Device {
         }
         buf[..name.len()].copy_from_slice(name.as_bytes());
         buf[name.len()] = 0;
-        let p = unsafe { device_manager_get(buf.as_ptr() as *const c_char) };
+        let slot = unsafe { &*core::ptr::addr_of!(g_app_slot) };
+        let get = slot.dev_get?;                 // None → 服务表未初始化
+        let p = get(buf.as_ptr() as *const c_char);
         if p.is_null() {
             None
         } else {
@@ -50,14 +37,14 @@ impl Device {
 
     pub fn open(&self) -> i32 {
         match self.vt().open {
-            Some(f) => f(self.0),
+            Some(f) => f(self.0 as *mut c_void),
             None => -1,
         }
     }
 
     pub fn close(&self) -> i32 {
         match self.vt().close {
-            Some(f) => f(self.0),
+            Some(f) => f(self.0 as *mut c_void),
             None => -1,
         }
     }
@@ -65,7 +52,7 @@ impl Device {
     /// 读设备；返回读到的字节数，<0 为错误。
     pub fn read(&self, buf: &mut [u8]) -> i32 {
         match self.vt().read {
-            Some(f) => f(self.0, buf.as_mut_ptr() as *mut c_void, buf.len()),
+            Some(f) => f(self.0 as *mut c_void, buf.as_mut_ptr() as *mut c_void, buf.len()),
             None => -1,
         }
     }
@@ -73,7 +60,7 @@ impl Device {
     /// 写设备；返回写入的字节数，<0 为错误。
     pub fn write(&self, buf: &[u8]) -> i32 {
         match self.vt().write {
-            Some(f) => f(self.0, buf.as_ptr() as *const c_void, buf.len()),
+            Some(f) => f(self.0 as *mut c_void, buf.as_ptr() as *const c_void, buf.len()),
             None => -1,
         }
     }
@@ -81,19 +68,15 @@ impl Device {
     /// 设备私有控制；cmd 见 ioctl 模块常量。
     pub fn ioctl(&self, cmd: i32, arg: *mut c_void) -> i32 {
         match self.vt().ioctl {
-            Some(f) => f(self.0, cmd, arg),
+            Some(f) => f(self.0 as *mut c_void, cmd, arg),
             None => -1,
         }
     }
 
     pub fn irq_id(&self) -> i32 {
         match self.vt().irq_id {
-            Some(f) => f(self.0),
+            Some(f) => f(self.0 as *mut c_void),
             None => -1,
         }
     }
-}
-
-extern "C" {
-    fn device_manager_get(name: *const c_char) -> *mut device;
 }
