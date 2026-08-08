@@ -1,0 +1,18 @@
+[package]
+name = "joc-app-rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# 编成静态库供 C 固件链接（不是可执行 crate）
+crate-type = ["staticlib"]
+name = "app"
+
+[profile.release]
+opt-level = "z"      # 尺寸优先（F407 192KB SRAM/1MB Flash）
+lto = true
+codegen-units = 1
+panic = "abort"      # 无 unwind；panic! -> UDF -> 内核 fault handler
+debug = false
+
+[dependencies]
