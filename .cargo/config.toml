@@ -6,7 +6,6 @@ target = "thumbv7em-none-eabihf"
 # 故不设置 linker / link-arg，避免 cargo 尝试生成可执行。
 rustflags = [
     "-C", "target-cpu=cortex-m4",
-    "-C", "target-feature=+fpregs,+fp16",
     "-C", "relocation-model=static",
     "-C", "linker-flavor=gcc",
 ]
