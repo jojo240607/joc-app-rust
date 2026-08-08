@@ -6,15 +6,27 @@ STM32F407（jOS RTOS）上的 **Rust 应用层**。与 C 固件（`joc-base`）�
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  C 固件 (joc-base)  → RTOS 内核 + 驱动 + 设备注册          │
-│    app_main_task 在控制台循环前调用 rust_app_start(ctx)    │
+│    app_main_task: app_slot_init() 填充函数指针表           │
+│                  → g_app_slot.app_start = rust_app_start   │
+│                  → app_start() 调用 App 入口              │
 └───────────────┬──────────────────────────────────────────┘
-                │  extern "C"  ABI 契约（rtos_abi.h）
+                │  extern g_app_slot（app_slot_t 服务表）
+                │  App 只经这张函数指针表拿能力，不碰裸 RTOS 符号
 ┌───────────────▼──────────────────────────────────────────┐
 │  Rust 应用层 (joc-app-rust) → 飞控 demo / 业务任务         │
-│    仅经 device vtable 操作外设，不碰裸寄存器               │
+│    经 g_app_slot 服务表调内核/IPC/设备；                  │
+│    经 irq_reg[] 注册中断回调（irq_manager 兜路由）；       │
+│    不碰裸寄存器 / NVIC / VTOR                              │
 │    产出 libapp.a，由 C 固件链接器统一链接                  │
 └──────────────────────────────────────────────────────────┘
 ```
+
+> **方案 Y 轻量版（当前落地）**：App 不直接 `extern "C"` 引用 `rtos_*` 裸符号，
+> 而是通过一个固定的 **`app_slot_t` 函数指针表 + 中断注册位**（`g_app_slot`）
+> 调用系统。系统侧 `app_slot_init()` 在运行时把函数指针填进表；App 只 `extern`
+> 引用同一地址、填 `irq_reg[]` 并调 `app_start`。这样 App 镜像与系统 ABI 完全解耦，
+> 系统升级只要 `RTOS_ABI_VERSION` 不变，App 镜像可直接复用。
+> 完整设计见 `joc-base/docs/app-slot-design.md`。
 
 ---
 
@@ -29,20 +41,28 @@ STM32F407（jOS RTOS）上的 **Rust 应用层**。与 C 固件（`joc-base`）�
 | `Cargo.toml` | crate-type=`staticlib`，产出 `libapp.a`；release profile 为 `opt-level=z` + `lto` + `panic=abort` |
 | `rust-toolchain.toml` | stable + `thumbv7em-none-eabihf` + `rust-src`/`llvm-tools-preview` |
 | `.cargo/config.toml` | `target-cpu=cortex-m4`、`relocation-model=static`；**不配置 linker**（链接由 C 侧完成） |
-| `build.rs` | 构建期校验 `RTOS_ABI_VERSION`（见 §3.3） |
-| `abi/rtos_abi.h` | **契约头**，从 joc-rtos 同步而来，是唯一权威定义 |
-| `src/abi.rs` | 手写镜像 `rtos_abi.h` 的 Rust 声明（`#[repr(C)]` 结构体 + `extern "C"` 函数） |
+| `build.rs` | 构建期校验 `RTOS_ABI_VERSION`（见 §3.4） |
+| `abi/rtos_abi.h` | **契约头**，从 joc-base 同步而来，是唯一权威定义 |
+| `src/abi.rs` | 手写镜像 `rtos_abi.h` + `app_slot_t` 的 Rust 声明（`#[repr(C)]` 结构体 + `extern "C"` 函数） |
 | `src/device.rs` | device vtable 的安全封装（`Device::get/open/read/write/ioctl`） |
 | `src/ioctl.rs` | 镜像 `rtos_abi_ioctl.h` 的驱动私有 ioctl 命令常量 |
-| `src/lib.rs` | 挂载点 `rust_app_start` + 任务栈 + demo/飞控任务 |
+| `src/lib.rs` | 挂载点 `rust_app_start`（经 `g_app_slot` 服务表）+ 任务栈 + demo/飞控任务 |
 
-### 1.2 挂载流程
+### 1.2 挂载流程（方案 Y 轻量版）
 
-1. C 固件 `task_app_main.c` 在控制台循环前调用 `rust_app_start(app_ctx)`，
-   该符号在 `#ifdef RUST_APP_LIB` 分支声明/调用（宏由 CMake 注入）。
-2. `rust_app_start` 内部用 ABI 契约**自行创建**所有 Rust 任务：
-   - `rust_demo`：普通任务（`rtos_task_create`，prio=14，每 500ms 心跳自增 `RUST_TICKS`）
-   - `att_rust`：硬实时姿态环（`rtos_task_create_rt`，prio=3，rt_class=RTOS_RT_HARD，priv=1）
+1. C 固件 `task_app_main.c`（`#ifdef RUST_APP_LIB`）在控制台循环前：
+   - 调 `app_slot_init()` 把内核函数指针填入 `g_app_slot`；
+   - 设 `g_app_slot.app_start = rust_app_start`（App 入口钉到服务表）；
+   - 调 `g_app_slot.app_start()` 进入 App。
+2. `rust_app_start(void)` 无参（**旧版经裸 `app_ctx_t*` 注入的签名已废弃**）。
+   内部：
+   - 校验 `magic` / `version` 双重防御 ABI 错配；
+   - 填 `g_app_slot.irq_reg[0]` 注册 TIM6（IRQ54，20Hz）→ `att_isr_give` 回调，
+     调 `g_app_slot.irq_attach()` 完成真实中断路由（由系统 `irq_manager` 兜住）；
+   - 经服务表 `task_create` / `task_create_rt` **自行创建**所有 Rust 任务：
+     - `rust_demo`：普通任务（prio=14，每 500ms 心跳自增 `RUST_TICKS`）
+     - `att_rust`：硬实时姿态环（prio=3，rt_class=RTOS_RT_HARD，priv=1）
+   - 经服务表 `dev_get`/`dev_open` + `TIMER_IOCTL_ENABLE` 启动 TIM6 计数器并 arm IRQ。
 3. C 固件对 Rust 任务内容**一无所知**——运行时 Rust 任务与 C 任务在内核眼里无差别。
 
 ### 1.3 内存约束（必须遵守）
@@ -102,54 +122,119 @@ cmake --build build
 
 ---
 
-## 3. 系统 API（ABI 契约）
+## 3. 系统 API（经 `app_slot_t` 服务表）
 
-所有 API 声明见 `src/abi.rs`（镜像 `abi/rtos_abi.h`）。以下为常用子集。
+所有能力经全局 `g_app_slot: app_slot_t`（见 `src/abi.rs`，镜像 C 侧
+`src/app_slot/app_slot.h`）。App **只经这张表的方法调用系统**，不再 `extern "C"`
+引用 `rtos_*` 裸符号（这是方案 Y 与早期「裸 ABI 直调」版本的根本区别）。
 
-### 3.1 任务
+### 3.1 app_slot_t 服务表布局
 
 ```rust
-rtos_task_create(name: *const c_char, entry, arg, prio: u8, stack, stack_size);
-rtos_task_create_rt(name, entry, arg, prio, stack, stack_size, priv: u8, attr: *const rtos_task_attr_t);
-rtos_msleep(ms: u32);
-rtos_tick_count() -> u32;          // 系统 tick 计数
-rtos_cycle_now() -> u32;           // DWT CYCCNT @HCLK，高精度相位补偿
+// src/abi.rs（#[repr(C)]，字段顺序须与 C 侧严格一致）
+pub struct app_slot_t {
+    pub magic: u32;          // APP_SLOT_MAGIC = 0x41505053 ("APPS")
+    pub version: u32;       // 须 == RTOS_ABI_VERSION
+    pub reserved: u32,
+    // 内核服务
+    pub task_create:  Option<...>,     // (name, entry, arg, prio, stack, stack_size)
+    pub task_create_rt: Option<...>,   // (+ priv, *const rtos_task_attr_t)
+    pub msleep: Option<extern "C" fn(u32)>,
+    pub tick_count: Option<extern "C" fn() -> u32>,
+    pub cycle_now:  Option<extern "C" fn() -> u32>,
+    // IPC 服务
+    pub sem_init:   Option<extern "C" fn(*mut rtos_sem_t, u32, u32)>,
+    pub sem_wait:   Option<extern "C" fn(*mut rtos_sem_t) -> i32>,
+    pub sem_trywait:Option<extern "C" fn(*mut rtos_sem_t) -> i32>,
+    pub sem_give:   Option<extern "C" fn(*mut rtos_sem_t)>,
+    // 设备服务（统一 device vtable 镜像）
+    pub dev_get:  Option<extern "C" fn(*const c_char) -> *mut device_t>,
+    pub dev_open: Option<extern "C" fn(*mut device_t) -> i32>,
+    pub dev_read: Option<extern "C" fn(*mut device_t, *mut c_void, usize) -> i32>,
+    pub dev_write:Option<extern "C" fn(*mut device_t, *const c_void, usize) -> i32>,
+    pub dev_ioctl:Option<extern "C" fn(*mut device_t, i32, *mut c_void) -> i32>,
+    pub dev_close:Option<extern "C" fn(*mut device_t) -> i32>,
+    // 中断回调注册位（方案 Y 轻量版关键）
+    pub irq_reg:   [app_irq_reg_t; APP_IRQ_REG_MAX],   // APP_IRQ_REG_MAX = 8
+    pub irq_attach:  Option<extern "C" fn(*const app_irq_reg_t) -> i32>,
+    pub irq_enable:  Option<extern "C" fn(u8) -> i32>,
+    pub irq_disable: Option<extern "C" fn(u8) -> i32>,
+    // 生命周期（系统侧填入 App 入口）
+    pub app_start: Option<extern "C" fn() -> i32>,
+    pub app_stop:  Option<extern "C" fn()>,
+}
+extern "C" { pub static mut g_app_slot: app_slot_t; }  // 系统预留符号，App 不可自定
+```
+
+### 3.2 任务（经服务表）
+
+```rust
+// 取表并通过 Option 调用（None 防御）
+let slot = &*core::ptr::addr_of!(g_app_slot);
+if let Some(tc) = slot.task_create {
+    tc("rust_demo\0".as_ptr(), rust_task_entry, 0 as *mut c_void,
+       RTOS_PRIO_BLINK, stack.as_mut_ptr() as *mut c_void, stack.len());
+}
+// 硬实时：task_create_rt(name, entry, arg, prio, stack, stack_size, priv, *attr)
 ```
 
 优先级常量：`RTOS_PRIO_BH_HIGH=4`、`RTOS_PRIO_BH_MED=6`、`RTOS_PRIO_MAIN=12`、
 `RTOS_PRIO_BLINK=14`、`RTOS_PRIO_BIST=24`、`RTOS_PRIO_IDLE=31`。
 硬实时类别：`RTOS_RT_NONE=0`、`RTOS_RT_HARD=1`、`RTOS_RT_SOFT=2`。
 
-### 3.2 IPC
+### 3.3 IPC（经服务表）
 
 ```rust
-// 信号量
-rtos_sem_init(&sem, initial, limit);
-rtos_sem_wait(&sem) -> i32;        // 阻塞
-rtos_sem_trywait(&sem) -> i32;     // 非阻塞，-1 无许可
-rtos_sem_give(&sem);               // ISR 安全
-
-// 互斥量 / 消息队列 / 事件标志：见 abi.rs 同名 extern "C"
+let slot = &*core::ptr::addr_of!(g_app_slot);
+if let Some(si) = slot.sem_init { si(&raw mut ATT_SEM as *mut rtos_sem_t, 0, 64); }
+if let Some(sw) = slot.sem_wait { sw(&raw mut ATT_SEM as *mut rtos_sem_t); }  // 阻塞
+if let Some(g)  = slot.sem_give { g(sem); }                                   // ISR 安全
 ```
 
-### 3.3 设备（唯一外设入口）
+互斥量 / 消息队列 / 事件标志：见 `src/abi.rs` 同名 `Option<extern "C" fn>` 字段。
+
+### 3.4 设备（唯一外设入口）
 
 ```rust
-let dev = Device::get("uart0").expect("no uart0");
-dev.open();
-let n = dev.write(b"hello");
-let m = dev.read(&mut buf);
-dev.ioctl(UART_IOCTL_SET_BAUDRATE, &mut arg as *mut _ as *mut c_void);
+let slot = &*core::ptr::addr_of!(g_app_slot);
+let dev = if let Some(dg) = slot.dev_get { dg("uart0\0".as_ptr()) } else { null_mut() };
+let _ = (slot.dev_open)(dev);
+let n = (slot.dev_write)(dev, buf.as_ptr() as *const c_void, buf.len());
+// 也提供安全封装 src/device.rs：Device::get/open/read/write/ioctl
 ```
 
-- **Rust 不碰裸寄存器**，所有驱动操作经 `device` vtable。
+- **Rust 不碰裸寄存器**，所有驱动操作经 `device` vtable（服务表的 `dev_*` 字段）。
 - ioctl 命令常量见 `src/ioctl.rs`（镜像 `rtos_abi_ioctl.h`，值与 C 侧严格一致）。
+- 定时器启动新增 `TIMER_IOCTL_ENABLE`(0x05) / `TIMER_IOCTL_DISABLE`(0x06)：
+  App 经 `dev_open("timer2")` + `dev_ioctl(TIMER_IOCTL_ENABLE, null)` 即可启动
+  TIM6 并 arm IRQ，无需裸 `event_device` vtable。
 
-### 3.4 ABI 版本校验
+### 3.5 中断回调注册（irq_reg[] 位）
 
-`RTOS_ABI_VERSION`（C 侧 `rtos_abi.h`）与 `RUST_ABI_VERSION`（`build.rs` 常量）必须相等。
-**任何契约结构体字段 / 函数签名变更都必须 +RTOS_ABI_VERSION，并同步 `src/abi.rs`**——
-否则 `cargo build` 直接失败，不会把漂移带进运行时。
+App 想挂 ISR 时**只填 `irq_reg[]` 注册位**，真实 NVIC 编程由系统 `irq_manager` 兜住：
+
+```rust
+let slot = &mut *core::ptr::addr_of_mut!(g_app_slot);
+let reg = &mut slot.irq_reg[0];
+reg.used       = 1;
+reg.irq_id     = 54;                 // TIM6 = IRQ54（板级 timer2）
+reg.prio_class = IRQ_CLASS_KERNEL;   // 1
+reg.rt_class   = 1;                  // 硬实时
+reg.isr_cb     = Some(att_isr_give); // App 回调：上半部只 sem_give
+reg.ctx        = &raw mut ATT_SEM as *mut c_void;
+if let Some(a) = slot.irq_attach { a(reg as *const app_irq_reg_t); }
+```
+
+`isr_cb` 约束（ISR 安全）：只做 `sem_give` / 写内存 / 置 flag；
+**不调** `task_create` / `mq_init` 等调度器变更 API（见 §1.4）。
+
+### 3.6 ABI 版本校验
+
+`RTOS_ABI_VERSION`（`g_app_slot.version`，源自 C 侧 `rtos_abi.h`）与
+`RUST_ABI_VERSION`（`build.rs` 常量）必须相等。
+**任何 `app_slot_t` 字段 / 函数签名变更都必须 +RTOS_ABI_VERSION，并同步 `src/abi.rs`**——
+否则 `cargo build` 直接失败，不会把漂移带进运行时。`rust_app_start` 还会在
+运行期复校 `magic` 与 `version`，错配立即返回错误。
 
 ---
 
@@ -157,26 +242,34 @@ dev.ioctl(UART_IOCTL_SET_BAUDRATE, &mut arg as *mut _ as *mut c_void);
 
 ### 4.1 板载运行时验证（无需调试器）
 
-固件烧录后，串口（CH340 COM8，115200）控制台：
+固件烧录后，`rust_task_entry` 每 500ms 经 `g_app_slot.dev_write` 向 `uart0` 打印：
 
 ```
-PING          → PONG                    （system 任务 + 控制台循环正常）
-RUST          → RUST mounted: rust_demo alive, ticks=N
+RUST ticks=0
+RUST ticks=1
+RUST ticks=2
+...
 ```
 
-`RUST` 命令调用 Rust 暴露的 `rust_ticks()` 并回显心跳计数；`ticks` 持续增长即证明
-Rust 任务在运行、C↔Rust 调用链打通。
+`ticks` 持续增长 + 串口出现上述行，即证明 App 经服务表挂载成功、`rust_task_entry`
+在调度、C↔Rust 调用链打通。也可在串口控制台发 `PING` → `PONG` 确认 system 任务正常。
 
 > 注意：串口打开时 CH340 的 DTR 脉冲会复位板子，所以连接后应等 BIST 跑完（~2s）再发命令。
+> 若主机串口在本环境抓不到，可用 JTAG（见 §4.2）直接确认 Rust 函数被调度。
 
-### 4.2 GDB 读任务池（确认 Rust TCB 挂载）
+### 4.2 GDB + OpenOCD 验证（JTAG，确证调度与中断）
 
 1. 启动常驻 OpenOCD（ST-Link + stm32f4x）：
    ```sh
    openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "init"
    ```
-2. 用 GDB 连 3333，reset run 跑几秒后读 `g_task_pool`（TCB 在 CCM，`task_t.name` 在 +4 偏移，
-   `state` 在 +11 单字节）：应能看到 `rust_demo`(prio14) 与 `att_rust`(prio3, rt_class=1) 条目。
+2. GDB 连 3333，下断点验证（已验证通过）：
+   - `break rust_app_start` → 命中证明 App 经 `g_app_slot.app_start` 被挂载；
+   - `break rust_task_entry` → 每 500ms 命中一次，证明 demo 任务在调度；
+   - `break att_isr_give` → TIM6(IRQ54) 溢出时命中，证明 `irq_reg[0]` 注册位经
+     `irq_manager` 正确路由、上半部 `sem_give` 生效。
+3. 也可读 `g_task_pool`（TCB 在 CCM，`task_t.name` 在 +4 偏移，`state` 在 +11
+   单字节）：应能看到 `rust_demo`(prio14) 与 `att_rust`(prio3, rt_class=1) 条目。
 
 ### 4.3 panic / fault
 
@@ -185,25 +278,31 @@ Rust 任务在运行、C↔Rust 调用链打通。
 
 ### 4.4 常见坑
 
-- **`RUST` 命令无输出 / `rust_ticks` 恒 0**：Rust 任务没挂载。检查
-  (a) 固件构建是否传了 `-DRUST_APP_LIB`；
-  (b) `task_app_main.c` 是否走到 `rust_app_start`（nm 查 ELF 应有 `rust_app_start` 符号）；
-  (c) `rust_task_entry` 是否真的在自增（当前实现每 500ms +1）。
+- **串口看不到 `RUST ticks=`**：先确认 `rust_app_start` 被调用（GDB 断 `rust_app_start`）。
+  若命中但无输出，查 `g_app_slot.dev_write` 是否被正确填充（`app_slot_init` 在
+  `task_app_main.c` 里先于 `app_start()` 调用）。
+- **TIM6 中断不触发 / `att_rust` 卡在 `sem_wait`**：App 建完任务后必须 `dev_ioctl(timer2,
+  TIMER_IOCTL_ENABLE, null)` 启动 TIM6 并 arm IRQ（驱动 ISR 清 UIF，App 回调只 `sem_give`）。
+  忘记 ENABLE 会让 `att_isr_give` 永不触发。
 - **链接报 undefined reference to `rust_app_start`**：CMake 没注入 `RUST_APP_LIB=1` 宏，
-  导致 C 侧 `#ifdef RUST_APP_LIB` 分支为假、`rust_app_start` 未声明调用 → libapp.a 被 gc 裁掉。
-- **链接报 undefined reference to `rust_ticks` 等**：`rust_app.h`（C 侧）声明了符号但 Rust 没实现，
-  或符号名/调用约定（extern "C"）不一致。
+  导致 C 侧 `#ifdef RUST_APP_LIB` 分支为假、`g_app_slot.app_start` 未赋值 → libapp.a 被 gc 裁掉。
+- **`rust_app_start` 返回前断言 version 不符**：`RTOS_ABI_VERSION`（`g_app_slot.version`）与
+  `build.rs` 的 `RUST_ABI_VERSION` 不一致，`cargo build` 应在链接期就失败；若漏检进运行时，
+  `rust_app_start` 会复校 `magic`/`version` 并返回错误，App 不挂载。
 - **栈溢出**：任务栈默认 1024/512 字节（opt-level=z 下 Rust 栈帧偏厚），飞控任务若用大局部数组需加大。
 
 ---
 
-## 5. 修改契约的步骤
+## 5. 修改契约的步骤（方案 Y：改 `app_slot_t`）
 
-1. 改 `joc-base` 的 `src/rtos/.../rtos_abi.h` 或新增 ioctl 命令 → **+RTOS_ABI_VERSION**（结构体/签名变更）。
-2. 把 `abi/rtos_abi.h` 同步到本工程的 `abi/rtos_abi.h`。
-3. 同步 `src/abi.rs` / `src/ioctl.rs` 的 `#[repr(C)]` 声明与常量。
+1. 改 `joc-base` 的 `src/app_slot/app_slot.h`（`app_slot_t` 字段 / 函数签名）或
+   新增 ioctl 命令（如 `src/drv/timer.h`）→ **+RTOS_ABI_VERSION**（结构体/签名变更）。
+2. 同步本工程 `src/abi.rs` 的 `app_slot_t` / `app_irq_reg_t` `#[repr(C)]` 声明与常量
+   （`RTOS_ABI_VERSION`、`APP_SLOT_MAGIC`、`APP_IRQ_REG_MAX`、ioctl 命令等）。
+3. 同步 `src/ioctl.rs` 的驱动私有 ioctl 命令常量。
 4. 若版本号变了，改 `build.rs` 的 `RUST_ABI_VERSION` 保持一致。
 5. `cargo build` 校验通过 → 走 §2.3 重新链接烧录。
+   （字段顺序必须与 C 侧逐字节一致；`#[repr(C)]` 保证布局，但仍需人工核对。）
 
 ---
 
@@ -211,8 +310,11 @@ Rust 任务在运行、C↔Rust 调用链打通。
 
 | 任务 | 类型 | prio | 栈 | 行为 |
 |------|------|------|-----|------|
-| `rust_demo` | 普通 | 14 | 1024B | 每 500ms `RUST_TICKS += 1`，供 `RUST` 命令观测 |
-| `att_rust`  | 硬实时(HARD) | 3 | 512B | 飞控姿态环占位（priv=1），扩展点 |
+| `rust_demo` | 普通 | 14 | 1024B | `rust_task_entry` 每 500ms 经 `dev_write` 打印 `RUST ticks=N` |
+| `att_rust`  | 硬实时(HARD) | 3 | 512B | `rust_attitude_loop`：经 `sem_wait` 等 TIM6 周期信号，`dev_read`(adc0)/`dev_ioctl`(pwm0) 占位控制律（priv=1） |
 
-扩展业务时，在 `rust_app_start` 内用 `rtos_task_create[_rt]` 增任务即可，
-RTOS C 侧无需改动。
+中断注册：`irq_reg[0]` = TIM6(IRQ54) → `att_isr_give(ATT_SEM)`，`irq_class=KERNEL`、`rt_class=HARD`；
+TIM6 经 `dev_open("timer2")` + `TIMER_IOCTL_ENABLE` 启动并 arm IRQ。
+
+扩展业务时，在 `rust_app_start` 内填更多 `irq_reg[]` 槽并调 `task_create[_rt]` 增任务即可，
+RTOS C 侧无需改动（只要 `app_slot_t` 服务表已暴露所需能力）。
