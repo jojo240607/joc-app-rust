@@ -19,6 +19,8 @@
 
 use core::ffi::c_char;
 
+use crate::{info, warn};
+
 use flyctrl_core::comm::link::{Frame, MAX_FRAME_LEN};
 use flyctrl_core::comm::mavlink;
 use flyctrl_core::controller::{Controller, PidController, Setpoint};
@@ -42,6 +44,7 @@ pub extern "C" fn flyctrl_entry(_arg: *mut core::ffi::c_void) {
     // 四轴 4 路电机：每路一个 pwmX（独立 TIM 通道，RTOS 已注册 5 路，取 0..3）。
     // PWM 是 control_device，只走 ioctl（write 直接返回 -1），故须用
     // PWM_IOCTL_GET_PERIOD_TICKS 取周期 + PWM_IOCTL_SET_DUTY_TICKS 设占空比。
+    info!(tag: "flyctrl", "task started; loop={}ms prio={}", FC_LOOP_MS, RTOS_PRIO_BH_HIGH);
     const PWM_CH: [&[u8]; 4] = [b"pwm0\0", b"pwm1\0", b"pwm2\0", b"pwm3\0"];
     let mut pwm_period: [u32; 4] = [0; 4];
     let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
@@ -57,9 +60,14 @@ pub extern "C" fn flyctrl_entry(_arg: *mut core::ffi::c_void) {
             }
             pwm_period[i] = period;
             pwm_dev[i] = Some(d);
+        } else {
+            warn!(tag: "flyctrl", "pwm{} not available -> actuator disabled", i);
         }
     }
     let uart_dev = Device::open(b"uart3\0");  // 遥测下行（USART6；uart0=USART1 调试控制台不占用）
+    if uart_dev.is_none() {
+        warn!(tag: "flyctrl", "uart3 (telemetry) not available -> no MAVLink downlink");
+    }
 
     // --- 传感器：由 Rust 经总线组合构建；缺失则降级（见 crate::sensors） ---
     let imu = ImuMpu6050::new(b"i2c0\0", 0x68); // MPU6050 @ I2C1
@@ -175,6 +183,14 @@ pub extern "C" fn flyctrl_entry(_arg: *mut core::ffi::c_void) {
         }
 
         seq = seq.wrapping_add(1);
+
+        // --- 心跳日志（节流：每 250 循环 ≈ 1s 一条，避免 4ms 周期刷爆串口） ---
+        if seq % 250 == 0 {
+            info!(tag: "flyctrl",
+                  "hb seq={} armed={} crit={} gps={} baro={} mag={} alt={:.2}",
+                  seq, armed, fdir.critical(), gps_available, baro_available, mag_available,
+                  est.pos[2].0);
+        }
 
         // --- 9) 节拍：经 RTOS 既有 msleep（SysTick 1000Hz 已驱动调度） ---
         unsafe {

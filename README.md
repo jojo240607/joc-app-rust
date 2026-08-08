@@ -63,19 +63,19 @@ App 有两种集成方式，编译期均与系统解耦：
 
 `rust_app_start(void)` 无参（**旧版经裸 `app_ctx_t*` 注入的签名已废弃**）。
 内部：
-- 校验 `magic` / `version` 双重防御 ABI 错配；
-- 填 `g_app_slot.irq_reg[0]` 注册 TIM6（IRQ54，20Hz）→ `att_isr_give` 回调，
-  调 `g_app_slot.irq_attach()` 完成真实中断路由（由系统 `irq_manager` 兜住）；
-- 经服务表 `task_create` / `task_create_rt` **自行创建**所有 Rust 任务：
-  - `rust_demo`：普通任务（prio=14，每 500ms 心跳自增 `RUST_TICKS`）
-  - `att_rust`：硬实时姿态环（prio=3，rt_class=RTOS_RT_HARD，priv=1）
-- 经服务表 `dev_get`/`dev_open` + `TIMER_IOCTL_ENABLE` 启动 TIM6 计数器并 arm IRQ。
+- 校验 `magic` / `version` 双重防御 ABI 错配（错配经 Rust 日志系统打 `error!` 并返回）；
+- 经 Rust 日志系统（`src/log.rs`）打 `info!` 自报 `RUST app mounted`（见 §4.1）；
+- `spawn_flyctrl_task()` 经服务表 `task_create_rt` **自行创建**飞控硬实时任务 `flyctrl`
+  （prio=`RTOS_PRIO_BH_HIGH`(4)，rt_class=HARD，priv=1，栈 2048B），在任务内跑
+  EKF+PID+FDIR+MAVLink 遥测（见 §7）。
 C 固件对 Rust 任务内容**一无所知**——运行时 Rust 任务与 C 任务在内核眼里无差别。
 轨 B 下系统对 App 内容完全不可见，只识别固定地址的头部 + 固定地址的 `g_app_slot`。
 
+> 早期示例用的 `rust_demo` / `att_rust` 占位任务已移除，当前挂载任务见 §6 / §7.1。
+
 ### 1.3 内存约束（必须遵守）
 
-- **任务栈放在主 SRAM 静态数组**（如 `RUST_DEMO_STACK: Stack1024`），**绝不进 CCM**。
+- **任务栈放在主 SRAM 静态数组**（如飞控的 `FLYCTRL_STACK: Stack2048`），**绝不进 CCM**。
   CCM 是 CPU-only（DMA 访问不到），且已被 RTOS 的 TCB 池/任务栈占满（~95%）。
 - 栈数组用 `#[repr(align(8))]` 包裹，满足 RTOS 栈对齐要求。
 - 所有 ABI 对象（sem/mutex/mq/event）的存储由 Rust 提供，但**不要放进 CCM 可达的 DMA 缓冲区**。
@@ -154,14 +154,15 @@ cmake --build build
 cd joc-base && flash_sys.bat          # stm32f407_minimal.bin -> 0x08000000
 
 # 日常应用层迭代（只动 App 分区）：
-cd joc-app-rust && python build_app.py && cd ../joc-base
-flash_app.bat                        # app.bin -> 0x08060000
-# 或一条龙双分区烧录：python _flash_stage2.py
+cd joc-app-rust && python build_app.py
+python flash.py --no-build          # 仅烧 App 分区 (0x08060000)
+# 或一条龙双分区烧录：python flash.py （自动 build_app.py + 烧系统区 + App 分区）
 ```
 
 `RTOS_ABI_VERSION` 变 → 运行期 `app_slot_load_app` 拒绝挂载并打印 `app ABI mismatch`，
-**不会**总线故障。验证：`python _verify_stage2.py` 断 App 入口确认到达且无 fault、
-断 `console_run` 确认 App 返回后系统恢复命令循环（`RESULT: STAGE-2 PASS`）。
+**不会**总线故障。验证：用 `python debug.py` 进 GDB，断 `rust_app_start` 确认到达且无 fault、
+断 `console_run` 确认 App 返回后系统恢复命令循环；或烧录后 `python listen.py` 看 COM8
+是否出现 `RUST app mounted` + `flyctrl: task started`（见 §4.1）。
 完整设计见 `joc-base/docs/app-slot-design.md` §7。
 
 ---
@@ -216,7 +217,7 @@ extern "C" { pub static mut g_app_slot: app_slot_t; }  // 系统预留符号，A
 // 取表并通过 Option 调用（None 防御）
 let slot = &*core::ptr::addr_of!(g_app_slot);
 if let Some(tc) = slot.task_create {
-    tc("rust_demo\0".as_ptr(), rust_task_entry, 0 as *mut c_void,
+    tc("rust_task\0".as_ptr(), rust_task_entry, 0 as *mut c_void,
        RTOS_PRIO_BLINK, stack.as_mut_ptr() as *mut c_void, stack.len());
 }
 // 硬实时：task_create_rt(name, entry, arg, prio, stack, stack_size, priv, *attr)
@@ -284,22 +285,74 @@ if let Some(a) = slot.irq_attach { a(reg as *const app_irq_reg_t); }
 
 ## 4. 调试与运行
 
-### 4.1 板载运行时验证（无需调试器）
+### 4.1 板载运行时验证 + Rust 应用层日志系统（无需调试器）
 
-固件烧录后，`rust_task_entry` 每 500ms 经 `g_app_slot.dev_write` 向 `uart0` 打印：
+Rust 应用层自带一套**独立于 C 侧系统日志**的日志系统（`src/log.rs`），专门给 App
+（飞控等 Rust 任务）使用，与系统 `I/main:` 日志靠前缀区分、物理同串口：
+
+- 系统日志：`I/main: jOS RTOS ready ...`（C 侧 `g_console`，前缀 `I/`）
+- Rust 日志：`R/<L> <ticks> <tag>: <msg>`（App 侧，前缀 `R/`）
+
+每条 Rust 日志含：**级别单字母**（`D`/`I`/`W`/`E`）+ **tick 时间戳**（`g_app_slot.tick_count()`）
++ **标签**（调用点模块/任务名，如 `app_slot` / `flyctrl`）+ 消息。
+
+#### 接口（宏风格，接近 `log` crate，手写 `no_std`）
+
+```rust
+use crate::{info, warn, error, debug};   // 宏由 #[macro_export] 导出到 crate 根
+
+info!(tag: "flyctrl", "task started; loop={}ms", 4);
+warn!(tag: "flyctrl", "pwm{} not available", i);
+error!(tag: "app_slot", "ABI mismatch magic={:#x}", magic);
+debug!(tag: "flyctrl", "verbose trace {}", x);  // 仅 debug build 编入，release 剔除
+```
+
+特性：
+- **三级 + debug**：`info!` / `warn!` / `error!` 始终编入；`debug!` 经 `cfg!(debug_assertions)`
+  **编译期剔除**（release build 不占体积）。
+- **时间戳 + 标签**：每条自动带 `tick_count()` 与调用点 `tag`，便于联调定位。
+- **通道**：复用 RTOS 调试控制台 `uart0`（USART1 / COM8）。日志为无状态写
+  （`dev_get("uart0")` + `dev_open` + `dev_write` + `dev_close`），**不持有设备句柄**，
+  不干扰 C 侧已打开的 `g_console`。`uart0` 是调试控制台，飞控业务下行仍走 USART6 遥测口。
+- **全部 `no_std`**，仅经 ABI 契约 `g_app_slot` 调用，不碰裸 RTOS 符号。
+
+#### 实机输出示例
+
+板子复位后 COM8（115200）可见（注意系统 `I/` 与 App `R/` 混在同一串口、靠前缀区分）：
 
 ```
-RUST ticks=0
-RUST ticks=1
-RUST ticks=2
-...
+I/main: jOS RTOS ready (STM32F407 Discovery, OOC)          ← C 侧系统日志
+I/main: READY. Commands: ...
+I/app_slot: [boot] app partition found: entry=0x080620AC -> mounting
+R/I 30 app_slot: RUST app mounted (rust_app_start)        ← Rust 日志（App 挂载自报）
+R/I 35 flyctrl: task started; loop=4ms prio=4             ← Rust 日志（飞控任务启动）
+R/I 500 flyctrl: hb seq=250 armed=0 crit=0 gps=0 baro=0 mag=0 alt=0.00  ← 节流心跳(≈1s/条)
 ```
 
-`ticks` 持续增长 + 串口出现上述行，即证明 App 经服务表挂载成功、`rust_task_entry`
-在调度、C↔Rust 调用链打通。也可在串口控制台发 `PING` → `PONG` 确认 system 任务正常。
+飞控任务每隔 250 个周期（≈1s）打一条节流心跳 `hb`，避免 4ms 周期刷爆串口。
 
 > 注意：串口打开时 CH340 的 DTR 脉冲会复位板子，所以连接后应等 BIST 跑完（~2s）再发命令。
-> 若主机串口在本环境抓不到，可用 JTAG（见 §4.2）直接确认 Rust 函数被调度。
+
+### 4.1b 运行 / 监听脚本（本工程正式脚本）
+
+| 脚本 | 作用 |
+|------|------|
+| `run_app.py` | 启动 OpenOCD + GDB `monitor reset run` 让板子从 Flash 运行，同时监听 COM8 输出（默认 12s） |
+| `listen.py`  | 纯监听 COM8（默认 18s），**不碰 OpenOCD**，最可靠——已 open 端口后手动按板子复位键触发启动打印 |
+
+```sh
+cd joc-app-rust
+python run_app.py                 # reset run + 监听（COM8 115200 12s）
+python run_app.py COM9 115200 20  # 指定端口/波特/秒数
+python listen.py                  # 纯监听，open 后手动按复位键
+```
+
+- 两个脚本打开端口时都强制 `dtr=False; rts=False`，避免 CH340 的 DTR 脉冲复位板子。
+- `run_app.py` 的 ST-Link `monitor reset run` 在部分板子上与 CH340 缓冲不同步，可能抓不到
+  启动打印（但板子确实在跑）；若输出为 0 字节，**改用 `listen.py` 并在其 open 端口后手动按
+  复位键**即可稳定捕获（与 §4.1 示例打印同一来源）。
+- 依赖：`run_app.py` 需 OpenOCD（路径硬编码在脚本顶部 `OCD_DIR`）+ `arm-none-eabi-gdb`（PATH）；
+  `listen.py` 仅需 `pyserial`。
 
 ### 4.2 烧录一条龙（本工程脚本）
 
@@ -334,7 +387,7 @@ python debug.py          # 进交互式 GDB，停在 rust_app_start
 > **Cortex-M 断点注意**：Flash 上**不能下软件断点**，`break`/`thbreak` 会报
 > `No hardware breakpoint support` 导致断点没设上、板子直接跑飞。必须改用
 > **`hbreak`**（硬件断点，Cortex-M 仅 6 个）。`debug.py` 已内置 `hbreak rust_app_start`。
-> 也可手动：`hbreak rust_task_entry`（每 500ms 命中，证 demo 调度）、
+> 也可手动：`hbreak flyctrl_entry`（证飞控任务被调度）、
 > `hbreak att_isr_give`（TIM6 IRQ54 命中，证 `irq_reg[0]` 经 `irq_manager` 路由）。
 
 断点验证结果（已实机验证 PASS）：
@@ -351,7 +404,7 @@ pc  0x8060094  <rust_app_start+20>
 （App 入口，见 `app.bin` 头部 entry）确认挂载到达且无 fault。
 
 也可读 `g_task_pool`（TCB 在 CCM，`task_t.name` 在 +4 偏移，`state` 在 +11 单字节）：
-应能看到 `rust_demo`(prio14) 与 `att_rust`(prio3, rt_class=1) 条目。
+应能看到 `flyctrl`(prio4, rt_class=1, priv=1) 条目。
 
 ### 4.3 panic / fault
 
@@ -360,18 +413,22 @@ pc  0x8060094  <rust_app_start+20>
 
 ### 4.4 常见坑
 
-- **串口看不到 `RUST ticks=`**：先确认 `rust_app_start` 被调用（GDB 断 `rust_app_start`）。
-  若命中但无输出，查 `g_app_slot.dev_write` 是否被正确填充（`app_slot_init` 在
-  `task_app_main.c` 里先于 `app_start()` 调用）。
-- **TIM6 中断不触发 / `att_rust` 卡在 `sem_wait`**：App 建完任务后必须 `dev_ioctl(timer2,
-  TIMER_IOCTL_ENABLE, null)` 启动 TIM6 并 arm IRQ（驱动 ISR 清 UIF，App 回调只 `sem_give`）。
-  忘记 ENABLE 会让 `att_isr_give` 永不触发。
+- **串口看不到 `RUST app mounted` / `flyctrl: task started`**：先确认 `rust_app_start`
+  被调用（GDB 断 `rust_app_start`）。命中但无 App 输出，查 `g_app_slot.dev_write` /
+  `dev_open` / `dev_get` 是否被正确填充（`app_slot_init` 在 `task_app_main.c` 里先于
+  `app_start()` 调用），以及 `uart0` 设备节点是否存在。若看到 `error! ... ABI mismatch`
+  则是 `RTOS_ABI_VERSION` 错配，App 拒绝挂载（属预期防御）。
+- **`run_app.py` 输出 0 字节**：ST-Link `monitor reset run` 在部分板子上与 CH340 缓冲不同步，
+  抓不到启动打印（但板子在跑）。改用 `listen.py` 并在其 open 端口后**手动按板子复位键**，
+  即可稳定捕获（与 §4.1 示例同一来源）。
 - **链接报 undefined reference to `rust_app_start`**：CMake 没注入 `RUST_APP_LIB=1` 宏，
   导致 C 侧 `#ifdef RUST_APP_LIB` 分支为假、`g_app_slot.app_start` 未赋值 → libapp.a 被 gc 裁掉。
 - **`rust_app_start` 返回前断言 version 不符**：`RTOS_ABI_VERSION`（`g_app_slot.version`）与
   `build.rs` 的 `RUST_ABI_VERSION` 不一致，`cargo build` 应在链接期就失败；若漏检进运行时，
   `rust_app_start` 会复校 `magic`/`version` 并返回错误，App 不挂载。
-- **栈溢出**：任务栈默认 1024/512 字节（opt-level=z 下 Rust 栈帧偏厚），飞控任务若用大局部数组需加大。
+- **栈溢出**：飞控任务栈 2048B（opt-level=z 下 Rust 栈帧偏厚），若用大局部数组需加大。
+- **串口 DTR 复位**：CH340 打开时 DTR 脉冲会复位板子；脚本已强制 `dtr=False`，但若用其他
+  串口助手，连接后请等 BIST 跑完（~2s）再发命令。
 
 ---
 
@@ -392,11 +449,11 @@ pc  0x8060094  <rust_app_start+20>
 
 | 任务 | 类型 | prio | 栈 | 行为 |
 |------|------|------|-----|------|
-| `rust_demo` | 普通 | 14 | 1024B | `rust_task_entry` 每 500ms 经 `dev_write` 打印 `RUST ticks=N` |
-| `att_rust`  | 硬实时(HARD) | 3 | 512B | `rust_attitude_loop`：经 `sem_wait` 等 TIM6 周期信号，`dev_read`(adc0)/`dev_ioctl`(pwm0) 占位控制律（priv=1） |
+| `flyctrl` | 硬实时(HARD) | 4 | 2048B | `flyctrl_entry`：EKF+PID+FDIR+MAVLink 遥测，经 imu/pwm/uart 设备 vtable（priv=1）；每 250 周期打节流心跳 `hb` |
 
 中断注册：`irq_reg[0]` = TIM6(IRQ54) → `att_isr_give(ATT_SEM)`，`irq_class=KERNEL`、`rt_class=HARD`；
-TIM6 经 `dev_open("timer2")` + `TIMER_IOCTL_ENABLE` 启动并 arm IRQ。
+TIM6 经 `dev_open("timer2")` + `TIMER_IOCTL_ENABLE` 启动并 arm IRQ（飞控任务当前用 `msleep(4ms)`
+节拍，TIM IRQ 精确同步为 TODO，见 §7.2）。
 
 扩展业务时，在 `rust_app_start` 内填更多 `irq_reg[]` 槽并调 `task_create[_rt]` 增任务即可，
 RTOS C 侧无需改动（只要 `app_slot_t` 服务表已暴露所需能力）。
@@ -426,9 +483,10 @@ RTOS C 侧无需改动（只要 `app_slot_t` 服务表已暴露所需能力）�
 
 | 任务 | 类型 | prio | 栈 | 行为 |
 |------|------|------|-----|------|
-| `rust_demo` | 普通 | 14 | 1024B | `rust_task_entry` 每 500ms 经 `dev_write` 打印 `RUST ticks=N` |
-| `att_rust`  | 硬实时(HARD) | 3 | 512B | `rust_attitude_loop`：TIM6 周期信号 + adc0/pwm0 占位控制律（priv=1） |
-| `flyctrl`   | 硬实时(HARD) | 4 | 2048B | `flyctrl_entry`：EKF+PID+FDIR+MAVLink，经 imu/pwm/uart 设备 vtable（priv=1） |
+| `flyctrl` | 硬实时(HARD) | 4 | 2048B | `flyctrl_entry`：EKF+PID+FDIR+MAVLink，经 imu/pwm/uart 设备 vtable（priv=1）；节流心跳经 Rust 日志 `info!` 打 `hb` |
+
+> 早期示例任务 `rust_demo` / `att_rust` 已移除，控制律全部并入 `flyctrl` 单硬实时任务。
+> 所有 App 侧打印统一走 `src/log.rs` 日志系统（前缀 `R/`），不再直接 `dev_write` 裸字符串。
 
 ### 7.2 RTOS 侧待补齐的设备约定（接入时由驱动实现）
 
@@ -436,4 +494,4 @@ RTOS C 侧无需改动（只要 `app_slot_t` 服务表已暴露所需能力）�
 - `"pwm"`  `write` → 16B 小端 4×f32 归一化推力 [0,1]
 - `"uart"` `write` → MAVLink v1 帧字节流（遥测下行；可复用 joc-base 的 USB CDC / UART 驱动）
 - （可选）`"gps"`/`"baro"`/`"mag"` `read` → 位置/高度/航向测量，喂入 `EkfEstimator` 与 `Fdir`
-- 周期同步：当前 `flyctrl_entry` 用 `rtos_msleep(4ms)`；RTOS 接入 TIM IRQ 后可经 `sem_wait` 精确同步（同 `att_rust` 模式，留 TODO）
+- 周期同步：当前 `flyctrl_entry` 用 `rtos_msleep(4ms)`；RTOS 接入 TIM IRQ 后可经 `sem_wait` 精确同步（同 TIM6 IRQ 模式，留 TODO）

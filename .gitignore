@@ -1,13 +1,12 @@
-# OpenOCD / GDB 调试与烧录脚本的运行时临时产物
+# Python 缓存
 __pycache__/
-_flash.gdb
-_ocd_flash.cfg
-_ocd_dbg.cfg
-_dbg.gdb
+
+# 调试/烧录脚本的运行时临时产物（临时 cfg / gdb 脚本 / openocd 日志）
+_ocd_*.cfg
+_*.gdb
+_*.txt
 ocd_*.log
-*ocd_dbg.log
-*ocd_flash.log
-*ocd_v.log
+*ocd_*.log
 
 # 构建产物（由 build_app.py 生成，按需提交可删此行）
 app.elf

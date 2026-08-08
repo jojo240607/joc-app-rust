@@ -13,6 +13,7 @@ pub mod device;
 pub mod ioctl;
 pub mod sensors;
 pub mod flyctrl_task;
+pub mod log;
 
 use abi::*;
 
@@ -23,6 +24,13 @@ use abi::*;
  *  - 驱动 IO 经 device vtable（dev_get/open/read/write/ioctl/close）。
  * 在此仅做版本校验并拉起飞控任务，RTOS C 侧不再包含任何 app 逻辑。
  * =========================================================================== */
+/// 调试自报：往调试控制台 uart0（USART1，RTOS 已持有，App 不占用）打一行，
+/// 证明 App 入口已执行、App 分区已成功挂载。仅查找 + open + write + close 本层临时句柄，
+/// 不影响 C 侧已打开的 g_console。
+fn report_mounted() {
+    info!(tag: "app_slot", "RUST app mounted (rust_app_start)");
+}
+
 #[no_mangle]
 pub extern "C" fn rust_app_start() -> i32 {
     unsafe {
@@ -30,8 +38,14 @@ pub extern "C" fn rust_app_start() -> i32 {
 
         // 双重防御：版本不符直接拒绝挂载（build.rs 已做链接期校验）
         if slot.magic != APP_SLOT_MAGIC || slot.version != RTOS_ABI_VERSION as u32 {
+            error!(tag: "app_slot", "ABI mismatch magic={:#x} ver={} (exp {})",
+                   slot.magic, slot.version, RTOS_ABI_VERSION);
             return -1;
         }
+
+        // 调试自报：往调试控制台 uart0（USART1，RTOS 已持有）打一行，证明 App 入口已执行。
+        // 不创建 Device 实例，避免 Drop 自动 close 干扰 C 侧已打开的控制台。
+        report_mounted();
 
         // 拉起飞控硬实时任务：EKF + PID + FDIR + MAVLink 遥测（经 RTOS 设备 vtable）。
         // 若 RTOS 尚未提供 imu/pwm/uart 设备节点，任务自动降级为模拟源，链路仍可验证。
