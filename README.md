@@ -48,22 +48,30 @@ STM32F407（jOS RTOS）上的 **Rust 应用层**。与 C 固件（`joc-base`）�
 | `src/ioctl.rs` | 镜像 `rtos_abi_ioctl.h` 的驱动私有 ioctl 命令常量 |
 | `src/lib.rs` | 挂载点 `rust_app_start`（经 `g_app_slot` 服务表）+ 任务栈 + demo/飞控任务 |
 
-### 1.2 挂载流程（方案 Y 轻量版）
+### 1.2 挂载流程（方案 Y 轻量版，含真·双分区）
 
-1. C 固件 `task_app_main.c`（`#ifdef RUST_APP_LIB`）在控制台循环前：
-   - 调 `app_slot_init()` 把内核函数指针填入 `g_app_slot`；
-   - 设 `g_app_slot.app_start = rust_app_start`（App 入口钉到服务表）；
-   - 调 `g_app_slot.app_start()` 进入 App。
-2. `rust_app_start(void)` 无参（**旧版经裸 `app_ctx_t*` 注入的签名已废弃**）。
-   内部：
-   - 校验 `magic` / `version` 双重防御 ABI 错配；
-   - 填 `g_app_slot.irq_reg[0]` 注册 TIM6（IRQ54，20Hz）→ `att_isr_give` 回调，
-     调 `g_app_slot.irq_attach()` 完成真实中断路由（由系统 `irq_manager` 兜住）；
-   - 经服务表 `task_create` / `task_create_rt` **自行创建**所有 Rust 任务：
-     - `rust_demo`：普通任务（prio=14，每 500ms 心跳自增 `RUST_TICKS`）
-     - `att_rust`：硬实时姿态环（prio=3，rt_class=RTOS_RT_HARD，priv=1）
-   - 经服务表 `dev_get`/`dev_open` + `TIMER_IOCTL_ENABLE` 启动 TIM6 计数器并 arm IRQ。
-3. C 固件对 Rust 任务内容**一无所知**——运行时 Rust 任务与 C 任务在内核眼里无差别。
+App 有两种集成方式，编译期均与系统解耦：
+
+- **轨 A（同编进一个 ELF，开发期方便）**：`joc-base` 用 `-DRUST_APP_LIB` 注入
+  `libapp.a`，`task_app_main.c` 走 `#ifdef RUST_APP_LIB` 分支：`app_slot_init()`
+  填充服务表 → `g_app_slot.app_start = rust_app_start` → 调用入口（见 §2.3）。
+- **轨 B（真分区，目标形态，已硬件验证 PASS）**：App 独立链接成 `app.bin`
+  （含 16B `app_header_t` 头部），单独烧到 `APP_FLASH` 分区；系统启动后
+  `app_slot_load_app()` 从固定地址 `0x08060000` 读头部、校验、清零 App `.bss`、
+  把入口钉到 `g_app_slot.app_start` 并调用。App 镜像与系统镜像**互不重编**。
+  两种轨共用同一份 `rust_app_start` 与服务表契约，差异只在"谁把入口送进 `g_app_slot`"。
+
+`rust_app_start(void)` 无参（**旧版经裸 `app_ctx_t*` 注入的签名已废弃**）。
+内部：
+- 校验 `magic` / `version` 双重防御 ABI 错配；
+- 填 `g_app_slot.irq_reg[0]` 注册 TIM6（IRQ54，20Hz）→ `att_isr_give` 回调，
+  调 `g_app_slot.irq_attach()` 完成真实中断路由（由系统 `irq_manager` 兜住）；
+- 经服务表 `task_create` / `task_create_rt` **自行创建**所有 Rust 任务：
+  - `rust_demo`：普通任务（prio=14，每 500ms 心跳自增 `RUST_TICKS`）
+  - `att_rust`：硬实时姿态环（prio=3，rt_class=RTOS_RT_HARD，priv=1）
+- 经服务表 `dev_get`/`dev_open` + `TIMER_IOCTL_ENABLE` 启动 TIM6 计数器并 arm IRQ。
+C 固件对 Rust 任务内容**一无所知**——运行时 Rust 任务与 C 任务在内核眼里无差别。
+轨 B 下系统对 App 内容完全不可见，只识别固定地址的头部 + 固定地址的 `g_app_slot`。
 
 ### 1.3 内存约束（必须遵守）
 
@@ -93,7 +101,7 @@ STM32F407（jOS RTOS）上的 **Rust 应用层**。与 C 固件（`joc-base`）�
   ```
 - 与 C 固件同一工具链的 `arm-none-eabi-gcc`（仅用于 C 侧链接，Rust 编译不调用）。
 
-### 2.2 构建 libapp.a
+### 2.2 构建 libapp.a（轨 A，同编进一个 ELF）
 
 ```sh
 cd joc-app-rust
@@ -104,7 +112,24 @@ cargo build --release --target thumbv7em-none-eabihf
 构建期 `build.rs` 会比对 `abi/rtos_abi.h` 的 `RTOS_ABI_VERSION` 与 `RUST_ABI_VERSION`，
 **不一致立即 panic**，阻断契约漂移。
 
-### 2.3 链接进 C 固件
+### 2.2b 构建独立 App 分区镜像（轨 B，真分区，推荐日常用）
+
+`build_app.py` 把 `libapp.a` 经独立链接脚本 `app.ld` 链接成 `app.elf`，再 `objcopy`
+成 `app.bin`（**自动带 16B `app_header_t` 头部**：magic=0x41504800 / abi=1 /
+`ABSOLUTE(rust_app_start)` / 0）。`app.ld` 用 `PROVIDE(g_app_slot=0x2001DC00)`
+把服务表地址钉死，App 不引用任何系统符号：
+
+```sh
+cd joc-app-rust
+cargo build --release --target thumbv7em-none-eabihf   # 先出 libapp.a
+python build_app.py                                    # -> app.elf / app.bin
+# app.bin 可直接烧到 APP_FLASH (0x08060000)
+```
+
+> 头部 entry 是**裸地址**（bit0=0）；系统侧 `app_slot_load_app()` 挂载时会 `OR 1`
+> 补 Thumb 位再经函数指针调用（Cortex-M 间接跳转目标必须带 Thumb 位，否则 INVSTATE 崩）。
+
+### 2.3 链接进 C 固件（轨 A）
 
 在 `joc-base` 侧用 `-DRUST_APP_LIB` 注入（CMakeLists.txt 已是注入式，无内联 cargo build）：
 
@@ -119,6 +144,25 @@ cmake --build build
 
 链接器用 `--gc-sections` 回收未引用符号；只有 `rust_app_start`（被 C 侧 `#ifdef` 分支引用）
 及其下游符号会被保留。
+
+### 2.3b 烧录工作流（轨 B：烧一次 RTOS，专注 App）
+
+**系统区与 App 区编译期解耦、可独立烧录**，满足"RTOS 烧一次后只烧 App 分区"的开发模式：
+
+```sh
+# 首次 / RTOS 升级时（偶尔）：只烧系统区
+cd joc-base && flash_sys.bat          # stm32f407_minimal.bin -> 0x08000000
+
+# 日常应用层迭代（只动 App 分区）：
+cd joc-app-rust && python build_app.py && cd ../joc-base
+flash_app.bat                        # app.bin -> 0x08060000
+# 或一条龙双分区烧录：python _flash_stage2.py
+```
+
+`RTOS_ABI_VERSION` 变 → 运行期 `app_slot_load_app` 拒绝挂载并打印 `app ABI mismatch`，
+**不会**总线故障。验证：`python _verify_stage2.py` 断 App 入口确认到达且无 fault、
+断 `console_run` 确认 App 返回后系统恢复命令循环（`RESULT: STAGE-2 PASS`）。
+完整设计见 `joc-base/docs/app-slot-design.md` §7。
 
 ---
 
@@ -264,10 +308,12 @@ RUST ticks=2
    openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "init"
    ```
 2. GDB 连 3333，下断点验证（已验证通过）：
-   - `break rust_app_start` → 命中证明 App 经 `g_app_slot.app_start` 被挂载；
-   - `break rust_task_entry` → 每 500ms 命中一次，证明 demo 任务在调度；
-   - `break att_isr_give` → TIM6(IRQ54) 溢出时命中，证明 `irq_reg[0]` 注册位经
-     `irq_manager` 正确路由、上半部 `sem_give` 生效。
+   - **轨 A**：`break rust_app_start` → 命中证明 App 经 `g_app_slot.app_start` 被挂载；
+     `break rust_task_entry` → 每 500ms 命中，证明 demo 任务在调度；
+     `break att_isr_give` → TIM6(IRQ54) 溢出命中，证明 `irq_reg[0]` 经 `irq_manager` 路由。
+   - **轨 B（App 在独立分区，系统 ELF 不含 Rust 符号）**：用绝对地址断点——
+     `break *0x08060080`（App 入口，见 `app.bin` 头部 entry）确认挂载到达且无 fault；
+     或直接在板子跑 `PING`→`PONG` + 看 `RUST ticks=` 串口输出确证调度。
 3. 也可读 `g_task_pool`（TCB 在 CCM，`task_t.name` 在 +4 偏移，`state` 在 +11
    单字节）：应能看到 `rust_demo`(prio14) 与 `att_rust`(prio3, rt_class=1) 条目。
 
