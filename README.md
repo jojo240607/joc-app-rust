@@ -301,21 +301,57 @@ RUST ticks=2
 > 注意：串口打开时 CH340 的 DTR 脉冲会复位板子，所以连接后应等 BIST 跑完（~2s）再发命令。
 > 若主机串口在本环境抓不到，可用 JTAG（见 §4.2）直接确认 Rust 函数被调度。
 
-### 4.2 GDB + OpenOCD 验证（JTAG，确证调度与中断）
+### 4.2 烧录一条龙（本工程脚本）
 
-1. 启动常驻 OpenOCD（ST-Link + stm32f4x）：
-   ```sh
-   openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "init"
-   ```
-2. GDB 连 3333，下断点验证（已验证通过）：
-   - **轨 A**：`break rust_app_start` → 命中证明 App 经 `g_app_slot.app_start` 被挂载；
-     `break rust_task_entry` → 每 500ms 命中，证明 demo 任务在调度；
-     `break att_isr_give` → TIM6(IRQ54) 溢出命中，证明 `irq_reg[0]` 经 `irq_manager` 路由。
-   - **轨 B（App 在独立分区，系统 ELF 不含 Rust 符号）**：用绝对地址断点——
-     `break *0x08060080`（App 入口，见 `app.bin` 头部 entry）确认挂载到达且无 fault；
-     或直接在板子跑 `PING`→`PONG` + 看 `RUST ticks=` 串口输出确证调度。
-3. 也可读 `g_task_pool`（TCB 在 CCM，`task_t.name` 在 +4 偏移，`state` 在 +11
-   单字节）：应能看到 `rust_demo`(prio14) 与 `att_rust`(prio3, rt_class=1) 条目。
+`flash.py` 把 OpenOCD 路径、系统镜像路径都硬编码在脚本顶部，在本工程目录即可一条龙烧录
+（系统区 `0x08000000` + App 分区 `0x08060000` 一起烧），**无需切到 joc-base**：
+
+```sh
+cd joc-app-rust
+python flash.py            # 自动 build_app.py 生成 app.bin + 自启 OpenOCD 烧录双分区
+python flash.py --no-build # 仅烧录（已生成过 app.bin 时）
+```
+
+- 脚本自启 OpenOCD（GDB server :3333）、用 GDB `monitor flash write_image erase` 烧两个分区、
+  烧完自动 SIGTERM 关闭 OpenOCD，不留后台进程。
+- 系统镜像默认取 `../joc-base/build_stage2/stm32f407_minimal.bin`（joc-base 需 `-DSTAGE2=ON`
+  构建）；OpenOCD 路径默认 `D:/soft/openocd/...`。若环境不同，改 `flash.py` 顶部的
+  `SYS_BIN` / `OCD_DIR` 即可。
+
+### 4.3 GDB + OpenOCD 调试（本工程 `debug.py`）
+
+`debug.py` 自启 OpenOCD 并进入交互式 GDB，在 App 挂载入口 `rust_app_start` 断住，
+可直接单步 / 看变量 / 查服务表：
+
+```sh
+cd joc-app-rust
+python debug.py          # 进交互式 GDB，停在 rust_app_start
+```
+
+断住后常用 GDB 命令：`c`（继续跑）、`si`/`stepi`（单步）、`bt`（栈）、
+`p g_app_slot`（看服务表）、`info registers`、`monitor reset halt`（重新 halt）。
+
+> **Cortex-M 断点注意**：Flash 上**不能下软件断点**，`break`/`thbreak` 会报
+> `No hardware breakpoint support` 导致断点没设上、板子直接跑飞。必须改用
+> **`hbreak`**（硬件断点，Cortex-M 仅 6 个）。`debug.py` 已内置 `hbreak rust_app_start`。
+> 也可手动：`hbreak rust_task_entry`（每 500ms 命中，证 demo 调度）、
+> `hbreak att_isr_give`（TIM6 IRQ54 命中，证 `irq_reg[0]` 经 `irq_manager` 路由）。
+
+断点验证结果（已实机验证 PASS）：
+```
+Hardware assisted breakpoint 1 at 0x8060094
+Breakpoint 1, 0x08060094 in rust_app_start ()
+pc  0x8060094  <rust_app_start+20>
+```
+说明：加载双符号时 `add-symbol-file app.elf 0x08060000` 会把 `.text_addr` 解析到
+`0x8060000`，GDB 报 `section .text not found` 是 app.elf 用 `app.ld` 链接、section 名
+不同的无害警告，不影响符号与断点。
+
+也可用绝对地址断点（轨 B 系统 ELF 不含 Rust 符号时）：`hbreak *0x08060080`
+（App 入口，见 `app.bin` 头部 entry）确认挂载到达且无 fault。
+
+也可读 `g_task_pool`（TCB 在 CCM，`task_t.name` 在 +4 偏移，`state` 在 +11 单字节）：
+应能看到 `rust_demo`(prio14) 与 `att_rust`(prio3, rt_class=1) 条目。
 
 ### 4.3 panic / fault
 
