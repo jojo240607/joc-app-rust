@@ -11,6 +11,7 @@
 pub mod abi;
 pub mod device;
 pub mod ioctl;
+pub mod flyctrl_task;
 
 use core::ffi::{c_char, c_void};
 
@@ -125,6 +126,11 @@ pub extern "C" fn rust_app_start() -> i32 {
                 }
             }
         }
+
+        // 5) 接入真实飞控任务：EKF + PID + FDIR + MAVLink 遥测（经 RTOS 设备 vtable）。
+        //    若 RTOS 尚未提供 imu/pwm 设备节点，任务自动降级为模拟源，链路仍可验证。
+        crate::flyctrl_task::spawn_flyctrl_task();
+
         0
     }
 }

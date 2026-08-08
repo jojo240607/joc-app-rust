@@ -400,3 +400,40 @@ TIM6 经 `dev_open("timer2")` + `TIMER_IOCTL_ENABLE` 启动并 arm IRQ。
 
 扩展业务时，在 `rust_app_start` 内填更多 `irq_reg[]` 槽并调 `task_create[_rt]` 增任务即可，
 RTOS C 侧无需改动（只要 `app_slot_t` 服务表已暴露所需能力）。
+
+## 7. 飞控接入 `flyctrl-core`（真实控制算法示例）
+
+把独立的 `flyctrl` 飞控项目（EKF 估计 + PID/LQR/MPC 控制 + FDIR + MAVLink 遥测）作为 App 层依赖接入，
+在硬实时任务里跑真实控制律，**不依赖 RTOS 后端的具体寄存器实现**：
+
+- 依赖：`Cargo.toml` 加 `flyctrl-core = { path = "../flyctrl/core" }`（**不启用 `stm32f407`**，
+  App 经 RTOS 设备 vtable 做 IO，绝不碰裸寄存器，规避 CCM/MPU/DMA 风险）。
+  `flyctrl-core` 为 `no_std` + 仅依赖 `libm`，可干净交叉编译到 `thumbv7em-none-eabihf`。
+- 任务：`src/flyctrl_task.rs` 的 `flyctrl_entry`（经 `spawn_flyctrl_task()` 在 `rust_app_start` 中创建，
+  `rtos_task_create_rt`，prio=`RTOS_PRIO_BH_HIGH`(4)，priv=1）。
+- 算法链路（每周期）：
+  1. 经 `g_app_slot.dev_*` 读 `"imu"`（约定 24B=6×f32 LE：accel3+gyro3）→ `ImuSample`；
+  2. `EkfEstimator::step` 估计 `VehicleState`（位置测量当前 `None`，待 GPS/baro 设备接入）；
+  3. `Fdir::update`（四源监控）+ `RtlHome::try_lock`（首次定位锁 home）；
+  4. `PidController::control`（armed 才出推力，否则零油门）；
+  5. 经 `"pwm"` 写 16B=4×f32 归一化推力（X 型混控）；
+  6. 经 `"uart"` 下行标准 MAVLink（HEARTBEAT + LOCAL_POSITION_NED + SYS_STATUS，QGC 可解析）。
+- **降级策略**：若 RTOS 尚未提供 `imu`/`pwm` 设备节点（当前阶段），`Device::open` 返回 `None`，
+  任务自动切换为内置 `SimImu` 模拟源 + 丢弃 PWM 写，保证 EKF+PID+FDIR+MAVLink 整链路仍可编译/运行/验证；
+  RTOS 侧补齐 `imu`/`pwm`/`uart` 设备节点（产出约定二进制格式）后，**无需改此文件即自动切换**。
+
+### 7.1 挂载任务表（更新）
+
+| 任务 | 类型 | prio | 栈 | 行为 |
+|------|------|------|-----|------|
+| `rust_demo` | 普通 | 14 | 1024B | `rust_task_entry` 每 500ms 经 `dev_write` 打印 `RUST ticks=N` |
+| `att_rust`  | 硬实时(HARD) | 3 | 512B | `rust_attitude_loop`：TIM6 周期信号 + adc0/pwm0 占位控制律（priv=1） |
+| `flyctrl`   | 硬实时(HARD) | 4 | 2048B | `flyctrl_entry`：EKF+PID+FDIR+MAVLink，经 imu/pwm/uart 设备 vtable（priv=1） |
+
+### 7.2 RTOS 侧待补齐的设备约定（接入时由驱动实现）
+
+- `"imu"`  `read` → 24B 小端 6×f32（accel.x,y,z, gyro.x,y,z）
+- `"pwm"`  `write` → 16B 小端 4×f32 归一化推力 [0,1]
+- `"uart"` `write` → MAVLink v1 帧字节流（遥测下行；可复用 joc-base 的 USB CDC / UART 驱动）
+- （可选）`"gps"`/`"baro"`/`"mag"` `read` → 位置/高度/航向测量，喂入 `EkfEstimator` 与 `Fdir`
+- 周期同步：当前 `flyctrl_entry` 用 `rtos_msleep(4ms)`；RTOS 接入 TIM IRQ 后可经 `sem_wait` 精确同步（同 `att_rust` 模式，留 TODO）

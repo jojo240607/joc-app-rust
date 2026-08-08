@@ -16,3 +16,13 @@ panic = "abort"      # 无 unwind；panic! -> UDF -> 内核 fault handler
 debug = false
 
 [dependencies]
+cortex-m = "0.7"             # 仅用于 fpu/simd 指令 / DSB 等（App 不直接操作裸寄存器）
+embedded-hal = "0.2"         # 提供 I2C/SPI 等 trait 占位（App 不直接碰裸寄存器）
+heapless = "0.8"             # 无堆环形缓冲（命令/帧缓冲）
+
+# 飞控核心算法（estimator/controller/vehicle/fdir/comm），no_std + 仅依赖 libm。
+# 不启用 stm32f407：App 经 RTOS 设备 vtable 做 IO，绝不碰裸寄存器（规避 CCM/MPU/DMA 风险）。
+flyctrl-core = { path = "../flyctrl/core" }
+
+# 数学函数（sinf/cosf），供占位 IMU 注入等使用（flyctrl-core 自身也依赖它）。
+libm = "0.2"
