@@ -7,7 +7,9 @@
  *       entry=ABSOLUTE(rust_app_start) / app_size=0(占位) / reserved=0
  *   - App 代码 XIP 运行（.app_code 在 APP_FLASH，绝对地址），无需重定位。
  *   - App 运行期 .bss 在 APP_RAM（0x2001E000，8K），由系统加载器清零。
- *   - App 不使用 .data（无需要 LMA 拷贝的初始化数据），全部 .bss/.rodata。 */
+ *   - App 不使用 .data：所有带非零 const 初始化器的 static（如含非零 enum 判别式的
+ *     EstState）一律用 `#[link_section=".bss.*"]` 强制进 .bss（初始化器被丢弃、由加载器
+ *     清零），再在运行时填充，避免落入 Flash 导致写 BusFault。 */
 
 MEMORY
 {

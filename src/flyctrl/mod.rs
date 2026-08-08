@@ -85,10 +85,18 @@ impl EstState {
     }
 }
 
+/// 最新估计状态 + 健康（control 写、telemetry/monitor 读）。
+/// 注意：含 `health: Health` enum（非零判别式），若用 `EstState::empty()` 作初始化器会带
+/// 非零字节、被 Rust 放进 `.data` 段；而 App 链接契约（XIP + 仅 .bss，见 app.ld）下 `.data`
+/// 会落到 Flash，运行时写它即写 Flash → BusFault。故用 `#[link_section=".bss.est_state"]`
+/// 强制进 .bss，并用 `zeroed()` 作全零初始化器（Health::Healthy=0 为合法变体，zeroed 安全）；
+/// 真正的初值在 `spawn_flyctrl` 里运行时 `EST_STATE = EstState::empty()` 填充——写落 RAM 安全。
+#[link_section = ".bss.est_state"]
+pub static mut EST_STATE: EstState = unsafe { core::mem::zeroed() };
+
 /// 全局共享帧 + 互斥量（静态存储，启动时 init）。
 pub static mut SENSOR_FRAME: SensorFrame = SensorFrame::empty();
 pub static mut SENSOR_MTX: Mutex = Mutex::uninit();
-pub static mut EST_STATE: EstState = EstState::empty();
 pub static mut EST_MTX: Mutex = Mutex::uninit();
 
 /* ===================== 任务栈 ===================== */
@@ -113,6 +121,9 @@ pub(crate) fn make_name(n: u8) -> &'static [u8] {
 
 /// 初始化共享互斥量并创建四任务。由 lib.rs::rust_app_start 调用。
 pub fn spawn_flyctrl() {
+    // 运行时填充 EST_STATE（其 static 被强制进 .bss，初始化器已丢弃，必须此处填充）。
+    unsafe { (*core::ptr::addr_of_mut!(EST_STATE)) = EstState::empty(); }
+
     // 初始化互斥量（天花板优先级取可能锁定者的最高 prio）
     unsafe {
         SENSOR_MTX.init(RTOS_PRIO_BH_HIGH); // sensors(5)/control(4) 都可能锁

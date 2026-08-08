@@ -43,10 +43,17 @@ impl Mutex {
     }
 
     /// 运行时初始化（只调一次）：二值信号量初值 1、上限 1。
-    pub fn init(&mut self, _ceil_prio: u8) {
+    ///
+    /// 注意：必须接收 `&self` 并经指针转换把 `self.sem` 地址传给 `sem_init`，
+    /// 不能取 `&mut self` 后写 `self.sem` —— 因为 `Mutex` 实例是 `static mut`，
+    /// 对 `static mut` 取 `&mut` 违反别名规则（Rust UB），会导致编译器把
+    /// 第二次 `init` 的写入优化掉（实测：SENSOR_MTX init 生效、EST_MTX 失效，
+    /// 表现为后建的互斥量 sem 仍为全 0 → sem_wait 永久阻塞 → 高优先任务饿死其余任务）。
+    /// 这里只做 `*const → *mut` 的指针转换（不创建 Rust 的 `&mut`），与 `lock`/`unlock` 一致。
+    pub fn init(&self, _ceil_prio: u8) {
         unsafe {
             if let Some(f) = (*addr_of!(g_app_slot)).sem_init {
-                f(&mut self.sem as *mut rtos_sem_t, 1, 1);
+                f(&self.sem as *const rtos_sem_t as *mut rtos_sem_t, 1, 1);
             }
         }
     }
@@ -75,6 +82,11 @@ impl Mutex {
     pub fn guard(&self) -> MutexGuard<'_> {
         self.lock();
         MutexGuard { m: self }
+    }
+
+    /// 诊断：返回当前 sem 计数（确认 init 是否生效）。
+    pub fn debug_count(&self) -> u32 {
+        unsafe { (*addr_of!(self.sem)).count }
     }
 }
 

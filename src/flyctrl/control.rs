@@ -114,17 +114,27 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 let us = 1000.0 + 1000.0 * m;
                 let ticks = (us * pwm_period[i] as f32 / 2500.0) as u32;
                 let mut t = ticks;
-                let _ = d.ioctl(ioctl::PWM_IOCTL_SET_DUTY_TICKS, &mut t as *mut u32 as *mut c_void);
+                let rc = d.ioctl(ioctl::PWM_IOCTL_SET_DUTY_TICKS, &mut t as *mut u32 as *mut c_void);
+                if seq == 0 { info!(tag: "ctrl", "dbg: pwm{} rc={} ticks={}", i, rc, ticks); }
             }
+        }
+        if seq == 0 { info!(tag: "ctrl", "dbg: after pwm"); }
+        if seq == 0 {
+            let (sc, ec) = unsafe { (SENSOR_MTX.debug_count(), EST_MTX.debug_count()) };
+            info!(tag: "ctrl", "dbg: sensor-mtx count={} est-mtx count={}", sc, ec);
         }
 
         // --- 发布估计状态（telemetry/monitor 读） ---
         {
             let _g = unsafe { EST_MTX.guard() };
+            if seq == 0 { info!(tag: "ctrl", "dbg: in est-guard"); }
             let s = unsafe { &mut *core::ptr::addr_of_mut!(EST_STATE) };
+            if seq == 0 { info!(tag: "ctrl", "dbg: est-addr got"); }
+            s.armed = armed;
+            if seq == 0 { info!(tag: "ctrl", "dbg: est-armed written"); }
             s.est = est;
             s.health = health;
-            s.armed = armed;
+            if seq == 0 { info!(tag: "ctrl", "dbg: est-written"); }
         }
         if seq == 0 { info!(tag: "ctrl", "dbg: est-mtx got"); }
 
