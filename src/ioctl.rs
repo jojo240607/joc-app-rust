@@ -51,6 +51,8 @@ pub const TEMP_IOCTL_GET_CAL1: i32 = 0x03;
 pub const TIMER_IOCTL_GET_OVERFLOWS: i32 = 0x01;
 pub const TIMER_IOCTL_GET_COUNTER: i32 = 0x02;
 pub const TIMER_IOCTL_SET_REPETITION: i32 = 0x03;
+pub const TIMER_IOCTL_ENABLE: i32 = 0x05;  /* start counting + arm update IRQ */
+pub const TIMER_IOCTL_DISABLE: i32 = 0x06; /* stop counting + mask update IRQ */
 
 /* ---- EXTI ---- */
 pub const EXTI_IOCTL_GET_COUNT: i32 = 0x30;

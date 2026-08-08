@@ -121,3 +121,116 @@ extern "C" {
     pub fn rtos_lock_scheduler();
     pub fn rtos_unlock_scheduler();
 }
+
+/* ===========================================================================
+ * app_slot_t 镜像（方案 Y 轻量版）：RTOS 系统暴露给 App 的「函数指针表 +
+ * 中断回调注册位」契约。字段顺序、调用约定须与 C 侧 src/app_slot/app_slot.h
+ * 严格一致。C 侧字段变更须同步本文件并 +RTOS_ABI_VERSION。
+ * =========================================================================== */
+pub const APP_SLOT_MAGIC: u32 = 0x4150_5053;   // "APPS"
+pub const APP_IRQ_REG_MAX: usize = 8;
+
+/* 中断类别（镜像 irq.h irq_class_t） */
+pub const IRQ_CLASS_NORMAL: u8 = 0;
+pub const IRQ_CLASS_KERNEL: u8 = 1;
+pub const IRQ_CLASS_ZERO_LATENCY: u8 = 2;
+
+#[repr(C)]
+pub struct app_irq_reg_t {
+    pub used: u8,
+    pub irq_id: u8,
+    pub prio_class: u8,   // 0=NORMAL,1=KERNEL,2=ZERO_LATENCY
+    pub rt_class: u8,     // 0=普通,1=硬实时
+    pub isr_cb: Option<extern "C" fn(*mut c_void)>,
+    pub ctx: *mut c_void,
+}
+
+/* 设备 vtable 镜像（与 rtos_abi.h deviceVtable 同构；device 指针 opaque） */
+#[repr(C)]
+pub struct deviceVtable {
+    pub open: Option<extern "C" fn(*mut c_void) -> i32>,
+    pub close: Option<extern "C" fn(*mut c_void) -> i32>,
+    pub read: Option<extern "C" fn(*mut c_void, *mut c_void, usize) -> i32>,
+    pub write: Option<extern "C" fn(*mut c_void, *const c_void, usize) -> i32>,
+    pub ioctl: Option<extern "C" fn(*mut c_void, i32, *mut c_void) -> i32>,
+    pub irq_id: Option<extern "C" fn(*mut c_void) -> i32>,
+}
+
+#[repr(C)]
+pub struct device_t {
+    pub vtable: *const deviceVtable,
+    pub type_: u32,
+    pub name: *const c_char,
+    pub class: u32,
+}
+
+/* ABI 版本：与 C 侧 tools/abi/rtos_abi.h 的 RTOS_ABI_VERSION 对齐。
+ * build.rs 在链接期比对两者，不一致则编译失败。 */
+pub const RTOS_ABI_VERSION: u32 = 1;
+
+pub type app_slot_irq_attach_t = extern "C" fn(*const app_irq_reg_t) -> i32;
+
+#[repr(C)]
+pub struct app_slot_t {
+    pub magic: u32,
+    pub version: u32,
+    pub reserved: u32,
+
+    /* 内核服务 */
+    pub task_create: Option<
+        extern "C" fn(
+            *const c_char,
+            rtos_task_entry_t,
+            *mut c_void,
+            u8,
+            *mut c_void,
+            usize,
+        ),
+    >,
+    pub task_create_rt: Option<
+        extern "C" fn(
+            *const c_char,
+            rtos_task_entry_t,
+            *mut c_void,
+            u8,
+            *mut c_void,
+            usize,
+            u8,
+            *const rtos_task_attr_t,
+        ),
+    >,
+    pub msleep: Option<extern "C" fn(u32)>,
+    pub tick_count: Option<extern "C" fn() -> u32>,
+    pub cycle_now: Option<extern "C" fn() -> u32>,
+
+    /* IPC 服务 */
+    pub sem_init: Option<extern "C" fn(*mut rtos_sem_t, u32, u32)>,
+    pub sem_wait: Option<extern "C" fn(*mut rtos_sem_t) -> i32>,
+    pub sem_trywait: Option<extern "C" fn(*mut rtos_sem_t) -> i32>,
+    pub sem_give: Option<extern "C" fn(*mut rtos_sem_t)>,
+
+    /* 设备服务 */
+    pub dev_get: Option<extern "C" fn(*const c_char) -> *mut device_t>,
+    pub dev_open: Option<extern "C" fn(*mut device_t) -> i32>,
+    pub dev_read: Option<extern "C" fn(*mut device_t, *mut c_void, usize) -> i32>,
+    pub dev_write: Option<extern "C" fn(*mut device_t, *const c_void, usize) -> i32>,
+    pub dev_ioctl: Option<extern "C" fn(*mut device_t, i32, *mut c_void) -> i32>,
+    pub dev_close: Option<extern "C" fn(*mut device_t) -> i32>,
+
+    /* 中断回调注册位 */
+    pub irq_reg: [app_irq_reg_t; APP_IRQ_REG_MAX],
+
+    /* 系统注册入口 */
+    pub irq_attach: Option<app_slot_irq_attach_t>,
+    pub irq_enable: Option<extern "C" fn(u8) -> i32>,
+    pub irq_disable: Option<extern "C" fn(u8) -> i32>,
+
+    /* 生命周期 */
+    pub app_start: Option<extern "C" fn() -> i32>,
+    pub app_stop: Option<extern "C" fn()>,
+}
+
+/* 系统在固定链接地址定义的实例；App 经 extern 引用，不可自行定义。 */
+extern "C" {
+    pub static mut g_app_slot: app_slot_t;
+}
