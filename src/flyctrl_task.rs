@@ -147,11 +147,14 @@ pub extern "C" fn flyctrl_entry(_arg: *mut core::ffi::c_void) {
         };
 
         // --- 7) 输出 PWM（4 路，各走 ioctl 设占空比 ticks） ---
-        // PWM 是 control_device：归一化推力 motor[i]∈[0,1] → ticks = motor[i] * period。
+        // PWM 是 control_device：归一化推力 motor[i]∈[0,1] → ESC 标准 1.0..2.0ms 脉宽。
+        // 周期 period_ticks 对应 2500us（400Hz），故脉宽 ticks = (1000+1000*m) * period/2500。
+        // motor=0 → 1000us(40%) 解锁最低转速；motor=1 → 2000us(80%) 满油门（行程 1000..2000us）。
         for i in 0..4 {
             if let Some(d) = &pwm_dev[i] {
                 let m = cmd.motor[i].clamp(0.0, 1.0);
-                let ticks = (m * pwm_period[i] as f32) as u32;
+                let us = 1000.0 + 1000.0 * m; // 脉宽 1000..2000 us
+                let ticks = (us * pwm_period[i] as f32 / 2500.0) as u32;
                 let mut t = ticks;
                 let _ = d.ioctl(
                     crate::ioctl::PWM_IOCTL_SET_DUTY_TICKS,
