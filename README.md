@@ -65,9 +65,9 @@ App 有两种集成方式，编译期均与系统解耦：
 内部：
 - 校验 `magic` / `version` 双重防御 ABI 错配（错配经 Rust 日志系统打 `error!` 并返回）；
 - 经 Rust 日志系统（`src/log.rs`）打 `info!` 自报 `RUST app mounted`（见 §4.1）；
-- `spawn_flyctrl_task()` 经服务表 `task_create_rt` **自行创建**飞控硬实时任务 `flyctrl`
-  （prio=`RTOS_PRIO_BH_HIGH`(4)，rt_class=HARD，priv=1，栈 2048B），在任务内跑
-  EKF+PID+FDIR+MAVLink 遥测（见 §7）。
+- `spawn_flyctrl()` 经服务表 `task_create_rt` **自行创建**飞控多任务（见 `src/flyctrl/`）：
+  `control`(prio=`RTOS_PRIO_BH_HIGH`(4)，rt_class=HARD，priv=1) / `sensors`(5) /
+  `telem`(12) / `monitor`(14)，在控制任务内跑 EKF+PID+FDIR+MAVLink 遥测（见 §7）。
 C 固件对 Rust 任务内容**一无所知**——运行时 Rust 任务与 C 任务在内核眼里无差别。
 轨 B 下系统对 App 内容完全不可见，只识别固定地址的头部 + 固定地址的 `g_app_slot`。
 
@@ -466,8 +466,9 @@ RTOS C 侧无需改动（只要 `app_slot_t` 服务表已暴露所需能力）�
 - 依赖：`Cargo.toml` 加 `flyctrl-core = { path = "../flyctrl/core" }`（**不启用 `stm32f407`**，
   App 经 RTOS 设备 vtable 做 IO，绝不碰裸寄存器，规避 CCM/MPU/DMA 风险）。
   `flyctrl-core` 为 `no_std` + 仅依赖 `libm`，可干净交叉编译到 `thumbv7em-none-eabihf`。
-- 任务：`src/flyctrl_task.rs` 的 `flyctrl_entry`（经 `spawn_flyctrl_task()` 在 `rust_app_start` 中创建，
-  `rtos_task_create_rt`，prio=`RTOS_PRIO_BH_HIGH`(4)，priv=1）。
+- 任务：`src/flyctrl/`（每任务一个文件：`control.rs` / `sensors_task.rs` / `telemetry.rs` /
+  `monitor.rs`，共享数据/栈/启动在 `mod.rs`）经 `spawn_flyctrl()` 在 `rust_app_start` 中创建，
+  `rtos_task_create_rt`，`control` prio=`RTOS_PRIO_BH_HIGH`(4)，priv=1。
 - 算法链路（每周期）：
   1. 经 `g_app_slot.dev_*` 读 `"imu"`（约定 24B=6×f32 LE：accel3+gyro3）→ `ImuSample`；
   2. `EkfEstimator::step` 估计 `VehicleState`（位置测量当前 `None`，待 GPS/baro 设备接入）；

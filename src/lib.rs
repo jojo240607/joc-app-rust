@@ -12,7 +12,8 @@ pub mod abi;
 pub mod device;
 pub mod ioctl;
 pub mod sensors;
-pub mod flyctrl_task;
+pub mod flyctrl;
+pub mod rtos_sync;
 pub mod log;
 
 use abi::*;
@@ -47,9 +48,9 @@ pub extern "C" fn rust_app_start() -> i32 {
         // 不创建 Device 实例，避免 Drop 自动 close 干扰 C 侧已打开的控制台。
         report_mounted();
 
-        // 拉起飞控硬实时任务：EKF + PID + FDIR + MAVLink 遥测（经 RTOS 设备 vtable）。
+        // 拉起飞控多任务：采样 / 控制 / 遥测 / 监控（经 RTOS 设备 vtable）。
         // 若 RTOS 尚未提供 imu/pwm/uart 设备节点，任务自动降级为模拟源，链路仍可验证。
-        crate::flyctrl_task::spawn_flyctrl_task();
+        crate::flyctrl::spawn_flyctrl();
 
         0
     }
