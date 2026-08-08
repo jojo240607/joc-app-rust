@@ -10,10 +10,12 @@
 //! - **降级**：若总线未注册或传感器无响应，IMU→SimImu 模拟源，Baro/Mag/Gps→标记源不可用，链路仍可验证。
 //!
 //! 设备/总线二进制约定：
-//!   * `"uart0"` write → MAVLink v1 帧字节流（遥测下行，RTOS 已注册 USART1）
+//!   * `"uart3"` write → MAVLink v1 帧字节流（遥测下行，RTOS 已注册 USART6）
 //!   * `"pwm0"`  write → 16B = 4×f32 LE 归一化推力 [0,1]（X 型混控，RTOS 已注册）
 //!   * `"i2c0"`  ioctl(I2C_IOCTL_MASTER_*) → 挂载 I2C 传感器的总线（RTOS 已注册 I2C1）
-//!   * `"uart1"` read  → GPS NMEA/UBX 字节流（RTOS 已注册 USART2；当前降级）
+//!   * `"uart1"` read  → GPS NMEA/UBX 字节流（RTOS 已注册 USART2）
+//!   * `"uart2"` read  → RC SBUS 字节流（RTOS 已注册 USART3）
+//!   * 注意：`"uart0"`(USART1) 是 RTOS 调试控制台（g_console 默认 d_uart），飞控不得占用。
 
 use core::ffi::c_char;
 
@@ -22,36 +24,50 @@ use flyctrl_core::comm::mavlink;
 use flyctrl_core::controller::{Controller, PidController, Setpoint};
 use flyctrl_core::estimator::{Estimator, EkfEstimator};
 use flyctrl_core::fdir::{Fdir, Health, RtlHome};
-use flyctrl_core::units::{Meter, Radian, Second};
-use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, Ned, PosSample, VehicleState};
+use flyctrl_core::hal::sensor::{GpsSensor, RcReceiver};
+use flyctrl_core::units::{Meter, MeterPerSecond, Radian, Second};
+use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, Ned, RcInput, VehicleState};
 
 use crate::abi::*;
 use crate::device::Device;
-use crate::sensors::{BaroBmp280, ImuMpu6050, MagQmc5883, SimImu};
+use crate::sensors::{BaroBmp280, GpsUblox, ImuMpu6050, MagQmc5883, RcSbus, SimImu};
 
 /// 控制环周期（ms）。当前经 RTOS `msleep` 节拍；与典型 PWM 频率同量级。
 const FC_LOOP_MS: u32 = 4;
 
-/// 把 4 路归一化推力打包为 16B 小端。
-fn pack_pwm(cmd: &ActuatorCmd) -> [u8; 16] {
-    let mut b = [0u8; 16];
-    for i in 0..4 {
-        b[i * 4..i * 4 + 4].copy_from_slice(&cmd.motor[i].to_le_bytes());
-    }
-    b
-}
-
 /// 飞控主循环（硬实时任务入口）。
 pub extern "C" fn flyctrl_entry(_arg: *mut core::ffi::c_void) {
-    // --- 总线/外设接入（RTOS 已注册：uart0/pwm0/i2c0/spi0） ---
-    let pwm_dev = Device::open(b"pwm0\0");    // 电机输出
-    let uart_dev = Device::open(b"uart0\0");  // 遥测下行（USART1）
-    let gps_dev = Device::open(b"uart1\0");   // GPS 串口（USART2；当前降级）
+    // --- 总线/外设接入（RTOS 已注册：uart3 遥测 / pwm0..3 / i2c0 / uart1 GPS / uart2 RC） ---
+    // 注意：uart0(USART1) 是 RTOS 调试控制台，飞控不占用。
+    // 四轴 4 路电机：每路一个 pwmX（独立 TIM 通道，RTOS 已注册 5 路，取 0..3）。
+    // PWM 是 control_device，只走 ioctl（write 直接返回 -1），故须用
+    // PWM_IOCTL_GET_PERIOD_TICKS 取周期 + PWM_IOCTL_SET_DUTY_TICKS 设占空比。
+    const PWM_CH: [&[u8]; 4] = [b"pwm0\0", b"pwm1\0", b"pwm2\0", b"pwm3\0"];
+    let mut pwm_period: [u32; 4] = [0; 4];
+    let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
+    for i in 0..4 {
+        if let Some(d) = Device::open(PWM_CH[i]) {
+            let mut period: u32 = 0;
+            let _ = d.ioctl(
+                crate::ioctl::PWM_IOCTL_GET_PERIOD_TICKS,
+                &mut period as *mut u32 as *mut core::ffi::c_void,
+            );
+            if period == 0 {
+                period = 2500; // 兜底：2.5ms（400Hz）与 PwmEsc 默认一致
+            }
+            pwm_period[i] = period;
+            pwm_dev[i] = Some(d);
+        }
+    }
+    let uart_dev = Device::open(b"uart3\0");  // 遥测下行（USART6；uart0=USART1 调试控制台不占用）
 
-    // --- 传感器：由 Rust 经总线（i2c0）组合构建；缺失则降级（见 crate::sensors） ---
+    // --- 传感器：由 Rust 经总线组合构建；缺失则降级（见 crate::sensors） ---
     let imu = ImuMpu6050::new(b"i2c0\0", 0x68); // MPU6050 @ I2C1
     let baro = BaroBmp280::new(b"i2c0\0", 0x76); // BMP280 @ I2C1
     let mag = MagQmc5883::new(b"i2c0\0", 0x0D); // QMC5883L @ I2C1
+    // GPS（NMEA，uart1/USART2）+ RC 接收机（SBUS，uart2/USART3）
+    let mut gps = GpsUblox::new(b"uart1\0");
+    let mut rc = RcSbus::new(b"uart2\0");
 
     // --- 飞控核心对象 ---
     let mut ekf = EkfEstimator::new(0.98, 0.01, 0.001, 0.1);
@@ -59,15 +75,12 @@ pub extern "C" fn flyctrl_entry(_arg: *mut core::ffi::c_void) {
     let mut fdir = Fdir::new();
     let mut rtl_home = RtlHome::new();
 
-    // 期望状态：原点悬停（真实应来自 MAVLink SETPOINT / 任务规划）。
-    let setpoint = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-1.0)], Radian(0.0));
-
     let mut sim_imu = SimImu::new();
     let mut frame_buf = [0u8; MAX_FRAME_LEN];
-    let mut gps_buf = [0u8; 128];
     let mut seq: u8 = 0;
-    let armed = false; // TODO: 经 MAVLink COMMAND_LONG 解锁后由命令链路置位（当前未接收入站命令）
-    let last_gps: Option<PosSample> = None;
+    // 解锁后锁定当前高度作为高度保持基准；油门摇杆在其上做 ±偏移。
+    let mut hold_alt = Meter(-1.0);
+    let mut alt_locked = false;
 
     loop {
         let dt = Second((FC_LOOP_MS as f32) / 1000.0);
@@ -81,19 +94,15 @@ pub extern "C" fn flyctrl_entry(_arg: *mut core::ffi::c_void) {
             None => sim_imu.next(dt.0),
         };
 
-        // --- 2) 采样 GPS（uart1 NMEA/UBX，可降级） ---
-        let gps = match &gps_dev {
-            Some(d) => {
-                let n = d.read(&mut gps_buf);
-                // TODO: 解析 NMEA/UBX → NED。当前仅占位：标记有串口但解析待实现。
-                if n > 0 {
-                    last_gps // 占位：未解析，沿用上一拍
-                } else {
-                    last_gps
-                }
-            }
-            None => None,
+        // --- 2) 采样 RC（SBUS/uart2；无接收机则中性、未解锁） ---
+        let rc_in: RcInput = match rc.as_mut() {
+            Some(r) => r.read(),
+            None => RcInput::neutral(),
         };
+        let armed = rc_in.armed && rc_in.fresh; // 解锁由 RC 开关决定
+
+        // --- 3) 采样 GPS（NMEA/uart1，可降级） ---
+        let gps = gps.as_mut().and_then(|g| g.read());
         let gps_available = gps.is_some();
 
         // --- 3) 采样 Baro（高度观测，可降级） ---
@@ -112,16 +121,43 @@ pub extern "C" fn flyctrl_entry(_arg: *mut core::ffi::c_void) {
             let _ = rtl_home.try_lock(Ned::new(est.pos[0].0, est.pos[1].0, est.pos[2].0));
         }
 
-        // --- 6) 控制律（armed 才输出推力，否则零油门） ---
-        let cmd: ActuatorCmd = if armed && !fdir.critical() {
+        // --- 解锁瞬间锁定当前高度作为高度保持基准 ---
+        if armed && !alt_locked {
+            hold_alt = est.pos[2];
+            alt_locked = true;
+        } else if !armed {
+            alt_locked = false; // 上锁重置基准
+        }
+
+        // --- 6) 期望状态：水平位置保持原点 + 高度定高（油门偏移） + 偏航缓动 ---
+        // 摇杆油门中位 0.5 → 偏移 [-1,1]（(thr-0.5)*2），驱动 ±2m 高度；yaw 做 ±0.5rad 目标。
+        let thr_off = (rc_in.throttle - 0.5) * 2.0;
+        let target_alt = hold_alt.0 - thr_off * 2.0; // 油门偏移 ±1 → 高度 ±2m
+        let setpoint = Setpoint {
+            pos: [Meter(0.0), Meter(0.0), Meter(target_alt)],
+            yaw: Radian(rc_in.yaw * 0.5),
+            vel: [MeterPerSecond(0.0); 3],
+        };
+
+        // --- 7) 控制律（armed 且链路健康才输出推力，否则零油门） ---
+        let cmd: ActuatorCmd = if armed && rc_in.fresh && !fdir.critical() {
             pid.control(dt, &setpoint, &est)
         } else {
             ActuatorCmd::zero()
         };
 
-        // --- 7) 输出 PWM ---
-        if let Some(d) = &pwm_dev {
-            let _ = d.write(&pack_pwm(&cmd));
+        // --- 7) 输出 PWM（4 路，各走 ioctl 设占空比 ticks） ---
+        // PWM 是 control_device：归一化推力 motor[i]∈[0,1] → ticks = motor[i] * period。
+        for i in 0..4 {
+            if let Some(d) = &pwm_dev[i] {
+                let m = cmd.motor[i].clamp(0.0, 1.0);
+                let ticks = (m * pwm_period[i] as f32) as u32;
+                let mut t = ticks;
+                let _ = d.ioctl(
+                    crate::ioctl::PWM_IOCTL_SET_DUTY_TICKS,
+                    &mut t as *mut u32 as *mut core::ffi::c_void,
+                );
+            }
         }
 
         // --- 8) 遥测下行（标准 MAVLink） ---

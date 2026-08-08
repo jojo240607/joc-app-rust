@@ -13,6 +13,17 @@ pub const UART_IOCTL_SET_BAUDRATE: i32 = 0x01;
 pub const UART_IOCTL_GET_BAUDRATE: i32 = 0x02;
 pub const UART_IOCTL_GET_BRR: i32 = 0x03;
 pub const UART_IOCTL_SET_FRAMING: i32 = 0x05;
+/// 设置电平反相（SBUS/反相外设需要）。arg = `*mut u32` 位掩码：
+///   bit0 = 接收反相 (USART_CR1.RXINV)
+///   bit1 = 发送反相 (USART_CR1.TXINV)
+/// 置 1 使能对应反相。依赖 RTOS uart 驱动实现该 ioctl（UART_IOCTL_SET_INVERTED=0x07）。
+pub const UART_IOCTL_SET_INVERTED: i32 = 0x07;
+/// 设置校验位：arg = `*mut u32`，0=无校验, 1=奇校验, 2=偶校验。
+/// （UART_IOCTL_SET_PARITY=0x08）
+pub const UART_IOCTL_SET_PARITY: i32 = 0x08;
+/// 设置停止位：arg = `*mut u32`，1 或 2 个停止位。
+/// （UART_IOCTL_SET_STOPBITS=0x09）
+pub const UART_IOCTL_SET_STOPBITS: i32 = 0x09;
 
 /* ---- GPIO pin ---- */
 pub const GPIO_IOCTL_TOGGLE: i32 = 0x01;
