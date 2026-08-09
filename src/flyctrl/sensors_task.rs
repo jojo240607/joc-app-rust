@@ -143,6 +143,7 @@ impl Sensors {
                     f.baro_alt = baro_sample;
                     f.gps = gps_sample;
                     f.rc = rc_input;
+                    f.armed = rc_input.armed;
                     f.imu_ok = imu_sample.is_some();
                     f.baro_ok = baro_sample.is_some();
                     f.gps_ok = gps_sample.is_some();

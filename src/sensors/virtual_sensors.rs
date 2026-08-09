@@ -13,6 +13,12 @@ use flyctrl_core::vehicle::{ImuSample, PosSample, RcInput};
 
 use crate::sensors::dataset::{Frame, PLAYBACK};
 
+/// 虚拟数据闭环演示开关：虚拟 RC 强制 `armed=true`，使控制律 PID→PWM 闭环真正执行。
+/// 数据集 `rc` 通道无 armed 位，正常回放语义应为 false（飞控不输出推力）。
+/// 当前保留为 `true`：以纯虚拟数据集驱动姿态解算→PID→PWM 整链路闭环演示，
+/// 用于板上验证飞控算法在无需真实硬件传感器时也能正常运行。
+const RC_FORCE_ARM: bool = true;
+
 /// IMU 加速度计测量的是"比力"（含重力），而 `ImuSample.accel` 语义为机体加速度（不含重力）。
 /// 数据集里的 `imu_accel` 为含重力值，这里减去近水平的重力分量得到比力。
 const GRAVITY: f32 = 9.81;
@@ -121,7 +127,7 @@ impl RcReceiver for VirtualRc {
             roll: r[1],
             pitch: r[2],
             yaw: r[3],
-            armed: false,
+            armed: RC_FORCE_ARM,
             mode: (r[4].clamp(0.0, 1.0) * 255.0) as u8,
             fresh: true,
         }

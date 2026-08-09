@@ -156,9 +156,10 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                   imu.is_some(), armed, fdir.critical(), est.pos[2].0);
         }
         if seq % 250 == 0 {
-            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} baro={} gz={:.2}",
+            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} baro={} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
                   seq, armed, fdir.critical(), est.pos[2].0,
-                  imu.is_some(), gps.is_some(), baro_alt.is_some(), est.vel[2].0);
+                  imu.is_some(), gps.is_some(), baro_alt.is_some(), est.vel[2].0,
+                  cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
         }
 
         msleep(4);
