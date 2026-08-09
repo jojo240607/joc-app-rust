@@ -9,6 +9,7 @@ use flyctrl_core::fdir::Health;
 
 use crate::abi::RTOS_PRIO_MAIN;
 use crate::device::Device;
+use crate::ioctl;
 use crate::{info, warn};
 use crate::rtos_sync::{msleep, tick_count};
 use crate::flyctrl::{EST_MTX, EST_STATE};
@@ -20,12 +21,21 @@ static mut FRAME_BUF: [u8; flyctrl_core::comm::link::MAX_FRAME_LEN] =
     [0u8; flyctrl_core::comm::link::MAX_FRAME_LEN];
 
 /// 遥测下行任务入口。
+///
+/// 下行通道优先级：USB CDC(`usb0`) > 串口(`uart3`)。USB CDC 是 CDC-ACM 虚拟串口，
+/// 电脑端免 USB-TTL 转接即可直接收到 MAVLink 流做仿真分析；仅当 USB 未枚举时回退
+/// 到 uart3（USART6）。usb0 与 C 侧 g_console(uart0) 相互独立，Rust 复用写数据不会
+/// 破坏控制台。写前用 `USB_IOCTL_CONNECTED` 探测枚举状态，未连接则跳过 usb、走 uart3。
 pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
-    info!(tag: "telem", "task started; period=20ms prio={}", RTOS_PRIO_MAIN);
+    info!(tag: "telem", "task started; period=20ms prio={} downlink=usb0(uart3 fallback)", RTOS_PRIO_MAIN);
 
+    let usb_dev = Device::open(b"usb0\0");
+    if usb_dev.is_none() {
+        warn!(tag: "telem", "usb0 (USB CDC) not available -> MAVLink only via uart3");
+    }
     let uart_dev = Device::open(b"uart3\0");
     if uart_dev.is_none() {
-        warn!(tag: "telem", "uart3 (telemetry) not available -> no MAVLink downlink");
+        warn!(tag: "telem", "uart3 (telemetry) not available -> no serial downlink");
     }
 
     let mut frame_buf = unsafe { &mut FRAME_BUF };
@@ -41,7 +51,20 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
             armed = s.armed;
         }
 
-        if let Some(d) = &uart_dev {
+        // 下行通道选择：USB CDC 已枚举则优先 usb0，否则回退 uart3。
+        // 避免往未枚举的 USB 端点堆积数据（被驱动静默丢弃或占 TX 缓冲）。
+        let use_usb = usb_dev.as_ref().map_or(false, |d| {
+            let mut conn: i32 = 0;
+            d.ioctl(ioctl::USB_IOCTL_CONNECTED, &mut conn as *mut i32 as *mut c_void) == 0
+                && conn != 0
+        });
+        let downlink = if use_usb {
+            usb_dev.as_ref()
+        } else {
+            uart_dev.as_ref()
+        };
+
+        if let Some(d) = downlink {
             let n = mavlink::encode_heartbeat(0, armed, seq, &mut frame_buf);
             let _ = d.write(&frame_buf[..n]);
             let n = mavlink::encode_local_pos_from(mavlink::SYS_ID, &est, seq, &mut frame_buf);
@@ -75,8 +98,9 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
                 }
             }
             info!(tag: "telem",
-                  "hb seq={} imu/gps/baro={}/{}/{} sens_armed={} crit={} uptime={}ms",
-                  seq, imu_ok, gps_ok, baro_ok, sens_armed, health == Health::Critical, crate::rtos_sync::tick_count());
+                  "hb seq={} ch={} imu/gps/baro={}/{}/{} sens_armed={} crit={} uptime={}ms",
+                  seq, if use_usb { "usb0" } else { "uart3" },
+                  imu_ok, gps_ok, baro_ok, sens_armed, health == Health::Critical, crate::rtos_sync::tick_count());
         }
 
         msleep(20);
