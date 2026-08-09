@@ -48,11 +48,58 @@ pub extern "C" fn rust_app_start() -> i32 {
         // 不创建 Device 实例，避免 Drop 自动 close 干扰 C 侧已打开的控制台。
         report_mounted();
 
-        // 拉起飞控多任务：采样 / 控制 / 遥测 / 监控（经 RTOS 设备 vtable）。
-        // 若 RTOS 尚未提供 imu/pwm/uart 设备节点，任务自动降级为模拟源，链路仍可验证。
+        // 拉起应用层多任务。
+        //  - demo feature：极简打日志任务，不碰任何外设，仅验证拉起链路；
+        //  - 默认：正式飞控多任务（采样/控制/遥测/监控，经 RTOS 设备 vtable）。
+        #[cfg(feature = "demo")]
+        crate::demo::spawn_demo();
+        #[cfg(not(feature = "demo"))]
         crate::flyctrl::spawn_flyctrl();
 
         0
+    }
+}
+
+/* ===========================================================================
+ * Demo 入口（feature = "demo"）：极简任务，只经 ABI 打周期日志，不碰任何外设。
+ * 目的：先验证「RTOS 异步 app_host 任务 → rust_app_start → 创建 RTOS 任务」
+ * 的拉起链路是否跑通，并能从 App 经 g_app_slot 打日志到控制台，console 不阻塞。
+ * 跑通后再切回正式 flyctrl（去掉 --features demo）。
+ * =========================================================================== */
+#[cfg(feature = "demo")]
+mod demo {
+    use crate::abi::*;
+    use crate::info;
+    use core::ffi::{c_char, c_void};
+
+    // demo 任务独立栈（放 App RAM，1KB 足够周期日志）。
+    static mut DEMO_STACK: [u8; 1024] = [0u8; 1024];
+
+    extern "C" fn demo_task_entry(_arg: *mut c_void) {
+        let mut n: u32 = 0;
+        loop {
+            n = n.wrapping_add(1);
+            info!(tag: "demo", "demo task alive seq={} ticks={}", n,
+                  unsafe { (*core::ptr::addr_of!(g_app_slot)).tick_count.map(|f| f()).unwrap_or(0) });
+            unsafe { rtos_msleep(500); }
+        }
+    }
+
+    pub fn spawn_demo() {
+        let name = b"demo_app\0".as_ptr() as *const c_char;
+        unsafe {
+            rtos_task_create_rt(
+                name,
+                demo_task_entry,
+                core::ptr::null_mut(),
+                RTOS_PRIO_BH_MED, // 中优先，不抢硬实时
+                DEMO_STACK.as_mut_ptr() as *mut c_void,
+                DEMO_STACK.len(),
+                1, // priv=1：App 任务保持特权，与正式 flyctrl 一致
+                core::ptr::null(),
+            );
+        }
+        info!(tag: "demo", "demo task spawned (link verified)");
     }
 }
 

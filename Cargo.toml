@@ -26,3 +26,10 @@ flyctrl-core = { path = "../flyctrl/core" }
 
 # 数学函数（sinf/cosf），供占位 IMU 注入等使用（flyctrl-core 自身也依赖它）。
 libm = "0.2"
+
+# 调试 feature：启用极简 demo 入口（只起一个打日志任务，不碰任何外设），
+# 用于先验证 App 拉起链路（RTOS 异步 app_host 任务）是否跑通，再切回正式 flyctrl。
+# 默认关闭。构建：`cargo build --release --features demo`（经 CMake RUST_APP_LIB 注入）。
+[features]
+default = []
+demo = []
