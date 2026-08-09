@@ -1,7 +1,10 @@
 //! joc-app-rust 应用层日志系统（区别于 C 侧 `I/main:` 系统日志）。
 //!
 //! 输出通道：复用 RTOS 调试控制台 `uart0`（USART1 / COM8），前缀统一 `R/...`，
-//! 与系统日志 `I/...` 明显区分，App 不独占该串口（每次写后 close，不干扰 C 侧 g_console）。
+//! 与系统日志 `I/...` 明显区分。App 仅 `get` 查找 + `write`，**绝不 open/close**：
+//! uart0 已由 C 侧 `g_console` 打开为控制台，App 复用同一设备实例；若 App 每次
+//! close 会把 C 侧控制台 UART 整个 deinit（清 UE/释放 PA9），导致 C 侧 printf 卡死
+//! 在 `uart_hal_putc` 的 TXE busy-wait，进而冻结整个系统。故只写不关。
 //!
 //! 特性：
 //!  - 三级：`info!` / `warn!` / `error!` + `debug!`（debug build 才编入）。
@@ -35,8 +38,11 @@ impl Level {
 
 /// 把一条日志经 uart0 写出。格式：`R/<L> <ticks> <tag>: <msg>\r\n`。
 ///
-/// 设计为无状态：每次 get + open + write + close，避免持有设备句柄干扰 C 侧控制台。
-/// 日志频率低（飞控仅周期/状态变更时打），该开销可接受。
+/// 复用 C 侧已打开的控制台 uart0：**只 get + write，绝不 open/close**。
+/// uart0 由 RTOS `g_console` 在启动早期 open 为控制台，App 共享同一设备实例；
+/// 若 App 重复 open/close 会把 C 侧控制台 UART 整个 deinit，导致 C 侧 printf
+/// 在 `uart_hal_putc` 的 TXE busy-wait 中死循环、冻结系统。日志频率低（飞控仅
+/// 周期/状态变更时打），该开销可接受。
 pub(crate) fn emit(level: Level, tag: &str, args: core::fmt::Arguments) {
     // 栈上缓冲：前缀 + 时间戳 + tag + msg。飞控单条日志不会超 160 字节。
     let mut buf = [0u8; 200];
@@ -78,9 +84,7 @@ pub(crate) fn emit(level: Level, tag: &str, args: core::fmt::Arguments) {
 
     unsafe {
         let slot = &*core::ptr::addr_of!(g_app_slot);
-        let (Some(get), Some(open), Some(write), Some(close)) = (
-            slot.dev_get, slot.dev_open, slot.dev_write, slot.dev_close,
-        ) else {
+        let (Some(get), Some(write)) = (slot.dev_get, slot.dev_write) else {
             return;
         };
         let name = b"uart0\0".as_ptr() as *const c_char;
@@ -88,11 +92,9 @@ pub(crate) fn emit(level: Level, tag: &str, args: core::fmt::Arguments) {
         if dev.is_null() {
             return;
         }
-        if open(dev) != 0 {
-            return;
-        }
+        // 仅写：uart0 已由 C 侧 g_console open 为控制台，App 不复用 open/close，
+        // 避免 deinit 共享 UART 导致 C 侧 printf 在 TXE busy-wait 死循环冻结系统。
         let _ = write(dev, buf.as_ptr() as *const c_void, len);
-        close(dev);
     }
 }
 
