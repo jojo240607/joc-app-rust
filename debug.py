@@ -9,7 +9,7 @@
 
 依赖（绝对路径已硬编码）：
   - OpenOCD: D:/soft/openocd/openocd-4e78563-i686-w64-mingw32
-  - 系统 ELF: ../joc-base/build_stage2/stm32f407_minimal.elf
+  - 系统 ELF: ../joc-base/build_rel/stm32f407_minimal.elf
   - 交叉工具: arm-none-eabi-gdb (需在 PATH)
 """
 import subprocess, sys, os, time, signal, socket
@@ -19,7 +19,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 OCD_DIR = "D:/soft/openocd/openocd-4e78563-i686-w64-mingw32"
 OCD_BIN = os.path.join(OCD_DIR, "bin", "openocd.exe")
 OCD_SCR = os.path.join(OCD_DIR, "share", "openocd", "scripts")
-SYS_ELF = os.path.join(BASE, "..", "joc-base", "build_stage2", "stm32f407_minimal.elf")
+SYS_ELF = os.path.join(BASE, "..", "joc-base", "build_rel", "stm32f407_minimal.elf")
 APP_ELF = os.path.join(BASE, "app.elf")
 APP_LOAD = "0x08060000"   # 与 app.ld APP_FLASH 一致
 GDB_PORT = 3333
@@ -47,7 +47,7 @@ def start_openocd():
     print("[ERR] OpenOCD 未就绪，看 ocd_dbg.log"); p.kill(); sys.exit(1)
 
 def main():
-    need(SYS_ELF, "系统 ELF (joc-base 需 -DSTAGE2=ON 构建)")
+    need(SYS_ELF, "系统 ELF (joc-base 需 build_rel.bat / -DRTOS_SELFTEST=OFF 构建)")
     need(APP_ELF, "App ELF (先 python build_app.py 或 flash.py)")
     ocd = start_openocd()
     sys_e = os.path.abspath(SYS_ELF).replace("\\", "/")

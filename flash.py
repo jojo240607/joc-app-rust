@@ -7,7 +7,9 @@
 
 依赖（绝对路径已硬编码，按本机环境）：
   - OpenOCD: D:/soft/openocd/openocd-4e78563-i686-w64-mingw32
-  - 系统镜像: ../joc-base/build_stage2/stm32f407_minimal.bin
+  - 系统镜像: ../joc-base/build_rel/stm32f407_minimal.bin
+    （joc-base 用 build_rel.bat / -DRTOS_SELFTEST=OFF 生成；其分区
+     APP_RAM=0x20006000/0x17C00、APP_SLOT=0x2001DC00 与 app.ld 一致）
   - 交叉工具: arm-none-eabi-gdb (需在 PATH)
 """
 import subprocess, sys, os, time, signal

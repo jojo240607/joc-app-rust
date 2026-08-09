@@ -367,9 +367,10 @@ python flash.py --no-build # 仅烧录（已生成过 app.bin 时）
 
 - 脚本自启 OpenOCD（GDB server :3333）、用 GDB `monitor flash write_image erase` 烧两个分区、
   烧完自动 SIGTERM 关闭 OpenOCD，不留后台进程。
-- 系统镜像默认取 `../joc-base/build_stage2/stm32f407_minimal.bin`（joc-base 需 `-DSTAGE2=ON`
-  构建）；OpenOCD 路径默认 `D:/soft/openocd/...`。若环境不同，改 `flash.py` 顶部的
-  `SYS_BIN` / `OCD_DIR` 即可。
+- 系统镜像默认取 `../joc-base/build_rel/stm32f407_minimal.bin`（joc-base 用 `build_rel.bat`
+  或 `-DRTOS_SELFTEST=OFF` 构建；其分区 APP_RAM=0x20006000/0x17C00、APP_SLOT=0x2001DC00
+  与本工程 `app.ld` 一致）；OpenOCD 路径默认 `D:/soft/openocd/...`。若环境不同，改 `flash.py`
+  顶部的 `SYS_BIN` / `OCD_DIR` 即可。
 
 ### 4.3 GDB + OpenOCD 调试（本工程 `debug.py`）
 

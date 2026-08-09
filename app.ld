@@ -16,7 +16,7 @@
 MEMORY
 {
   APP_FLASH (rx) : ORIGIN = 0x08060000, LENGTH = 384K
-  APP_RAM   (xrw): ORIGIN = 0x20006000, LENGTH = 0x17C00  /* 发布版：0x20006000..0x2001DC00 (约95KB)，须与 joc-base APP_RAM 注入值一致 */
+  APP_RAM   (xrw): ORIGIN = 0x2000D000, LENGTH = 0x10C00  /* 发布版：0x2000D000..0x2001DC00 (约67KB)；须与 joc-base APP_RAM 注入值一致（紧跟系统 .bss 之上，避免加载器清零时破坏 g_irq[]） */
 }
 
 /* 入口固定为 Rust 挂载点；header.entry 由链接器填其绝对地址 */
