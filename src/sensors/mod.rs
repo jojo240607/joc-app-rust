@@ -4,11 +4,13 @@
 //! MPU6050 / BMP280 / QMC5883L via I2C，GPS via UART（降级），缺失则 SimImu 模拟源。
 
 pub mod baro_bmp280;
+pub mod dataset;
 pub mod gps_ublox;
 pub mod imu_mpu6050;
 pub mod mag_qmc5883;
 pub mod rc_sbus;
 pub mod sim_imu;
+pub mod virtual_sensors;
 
 pub use baro_bmp280::BaroBmp280;
 pub use gps_ublox::GpsUblox;

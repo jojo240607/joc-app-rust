@@ -1,7 +1,7 @@
 //! 控制律硬实时任务（核心，4ms 周期）。
 //!
 //! 流程：取最新传感器帧 → EKF → FDIR → PID → PWM。
-//! 读 SENSOR_FRAME（经 SENSOR_MTX）、写 EST_STATE（经 EST_MTX）。
+//! 读 SENSOR_FRAME（经 seqlock，见 `SENSOR_SEQ`）、写 EST_STATE（经 EST_MTX）。
 
 use core::ffi::c_void;
 
@@ -17,7 +17,12 @@ use crate::ioctl;
 use crate::{info, warn};
 use crate::rtos_sync::msleep;
 use crate::sensors::SimImu;
-use crate::flyctrl::{make_name, EST_MTX, EST_STATE, SENSOR_FRAME, SENSOR_MTX};
+
+/// 诊断开关：开启后会在启动前几圈打印大量 dbg 行，极易压垮开机瞬间的
+/// 设备串口 TX 缓冲、导致同期的传感器任务日志被丢弃（误判传感器任务“死亡”）。
+/// 正常验证时关闭。
+const VERBOSE: bool = false;
+use crate::flyctrl::{make_name, EST_MTX, EST_STATE, SENSOR_FRAME, SENSOR_SEQ};
 
 /// 控制律硬实时任务入口。
 pub extern "C" fn control_entry(_arg: *mut c_void) {
@@ -52,20 +57,26 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     let mut first = true;
     loop {
         let dt = Second(4.0 / 1000.0);
-        if seq == 0 { info!(tag: "ctrl", "dbg: loop enter"); }
+        if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: loop enter"); }
 
-        // --- 取最新传感器帧（互斥保护，短临界区） ---
-        let (imu, rc, gps, baro_alt, armed);
-        {
-            let _g = unsafe { SENSOR_MTX.guard() };
-            let f = unsafe { &*core::ptr::addr_of!(SENSOR_FRAME) };
-            imu = f.imu;
-            rc = f.rc;
-            gps = f.gps;
-            baro_alt = f.baro_alt;
-            armed = f.armed;
+        // --- 取最新传感器帧（seqlock：control 优先级高于 sensors，读不被打断） ---
+        let (mut imu, mut rc, mut gps, mut baro_alt, mut armed);
+        unsafe {
+            let mut s1;
+            loop {
+                s1 = SENSOR_SEQ;
+                if s1 & 1 != 0 { continue; } // sensors 正在写，重试
+                let f = &*core::ptr::addr_of!(SENSOR_FRAME);
+                imu = f.imu;
+                rc = f.rc;
+                gps = f.gps;
+                baro_alt = f.baro_alt;
+                armed = f.armed;
+                let s2 = SENSOR_SEQ;
+                if s1 == s2 { break; } // 首尾一致，读取完整
+            }
         }
-        if seq == 0 { info!(tag: "ctrl", "dbg: sen-mtx got"); }
+        if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: sen-mtx got"); }
 
         // IMU 缺失 → 模拟源（总线异常降级）
         let imu_sample: ImuSample = match imu {
@@ -75,7 +86,6 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
 
         // --- 状态估计（EKF；GPS 位置测量可选） ---
         let est: VehicleState = ekf.step(dt, imu_sample, gps);
-        if seq == 0 { info!(tag: "ctrl", "dbg: ekf ok"); }
 
         // --- FDIR 监控（四源可用性；mag 暂用 false，待 I2C 修复后接 sensors 帧） ---
         let mag_ok = false; // TODO: 接 SENSOR_FRAME.mag_ok（待 joc-base I2C 修复）
@@ -104,10 +114,10 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         } else {
             ActuatorCmd::zero()
         };
-        if seq == 0 { info!(tag: "ctrl", "dbg: pid ok"); }
+        if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: pid ok"); }
 
         // --- 输出 PWM（4 路 ioctl 设占空比 ticks） ---
-        if seq == 0 { info!(tag: "ctrl", "dbg: before pwm"); }
+        if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: before pwm"); }
         for i in 0..4 {
             if let Some(d) = &pwm_dev[i] {
                 let m = cmd.motor[i].clamp(0.0, 1.0);
@@ -115,28 +125,28 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 let ticks = (us * pwm_period[i] as f32 / 2500.0) as u32;
                 let mut t = ticks;
                 let rc = d.ioctl(ioctl::PWM_IOCTL_SET_DUTY_TICKS, &mut t as *mut u32 as *mut c_void);
-                if seq == 0 { info!(tag: "ctrl", "dbg: pwm{} rc={} ticks={}", i, rc, ticks); }
+                if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: pwm{} rc={} ticks={}", i, rc, ticks); }
             }
         }
-        if seq == 0 { info!(tag: "ctrl", "dbg: after pwm"); }
-        if seq == 0 {
-            let (sc, ec) = unsafe { (SENSOR_MTX.debug_count(), EST_MTX.debug_count()) };
-            info!(tag: "ctrl", "dbg: sensor-mtx count={} est-mtx count={}", sc, ec);
+        if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: after pwm"); }
+        if VERBOSE && seq == 0 {
+            let ec = unsafe { EST_MTX.debug_count() };
+            info!(tag: "ctrl", "dbg: est-mtx count={} sensor-seq={}", ec, unsafe { SENSOR_SEQ });
         }
 
         // --- 发布估计状态（telemetry/monitor 读） ---
         {
             let _g = unsafe { EST_MTX.guard() };
-            if seq == 0 { info!(tag: "ctrl", "dbg: in est-guard"); }
+            if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: in est-guard"); }
             let s = unsafe { &mut *core::ptr::addr_of_mut!(EST_STATE) };
-            if seq == 0 { info!(tag: "ctrl", "dbg: est-addr got"); }
+            if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-addr got"); }
             s.armed = armed;
-            if seq == 0 { info!(tag: "ctrl", "dbg: est-armed written"); }
+            if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-armed written"); }
             s.est = est;
             s.health = health;
-            if seq == 0 { info!(tag: "ctrl", "dbg: est-written"); }
+            if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-written"); }
         }
-        if seq == 0 { info!(tag: "ctrl", "dbg: est-mtx got"); }
+        if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-mtx got"); }
 
         seq = seq.wrapping_add(1);
         if first {
@@ -146,10 +156,14 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                   imu.is_some(), armed, fdir.critical(), est.pos[2].0);
         }
         if seq % 250 == 0 {
-            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2}",
-                  seq, armed, fdir.critical(), est.pos[2].0);
+            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} baro={} gz={:.2}",
+                  seq, armed, fdir.critical(), est.pos[2].0,
+                  imu.is_some(), gps.is_some(), baro_alt.is_some(), est.vel[2].0);
         }
 
         msleep(4);
+        if VERBOSE && seq < 5 {
+            info!(tag: "ctrl", "dbg: after sleep seq={}", seq);
+        }
     }
 }

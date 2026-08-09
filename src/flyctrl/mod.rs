@@ -13,7 +13,7 @@
 //!   - `monitor`   prio=14 (priv=1)                    周期 1000ms：心跳日志 + 看门狗
 //!
 //! 跨任务共享数据经 RTOS 互斥量（`crate::rtos_sync::Mutex`）保护：
-//!   - SENSOR_FRAME / SENSOR_MTX：最新传感器样本（sensors 写、control 读）
+//!   - SENSOR_FRAME / SENSOR_SEQ：最新传感器样本（sensors 单写、control/monitor 读，seqlock 无锁）
 //!   - EST_STATE   / EST_MTX  ：最新估计状态 + 健康（control 写、telemetry/monitor 读）
 //!
 //! 注意：mag(QMC5883L@0x0D) 当前读取会在单总线 I2C 事务中卡死（见 memory：joc-app-rust
@@ -21,7 +21,6 @@
 //! 不实际发起读事务，避免拖垮采样线程。
 
 pub mod control;
-pub mod monitor;
 pub mod sensors_task;
 pub mod telemetry;
 
@@ -95,21 +94,28 @@ impl EstState {
 pub static mut EST_STATE: EstState = unsafe { core::mem::zeroed() };
 
 /// 全局共享帧 + 互斥量（静态存储，启动时 init）。
-pub static mut SENSOR_FRAME: SensorFrame = SensorFrame::empty();
-pub static mut SENSOR_MTX: Mutex = Mutex::uninit();
+/// 注意：与 `EST_STATE` 同理，`SensorFrame::empty()` 构造的 `Option<T>` 因无 niche，
+/// 其 padding 字节可能非零，会被 Rust 放入 `.data` 段而落到 Flash；sensors 任务写
+/// 它会触发 BusFault。故强制 `.bss.sensor_frame` + `zeroed()`（全零合法初值）。
+#[link_section = ".bss.sensor_frame"]
+pub static mut SENSOR_FRAME: SensorFrame = unsafe { core::mem::zeroed() };
+/// 共享帧顺序计数器（seqlock）：sensors 写前+1(奇)、写后+1(偶)；control 读时校验
+/// 首尾 seq 相等且为偶即一致。control(prio4) > sensors(prio5)，读过程不会被 sensors
+/// 抢占，故无需 retry 也能保证原子；seq 仅作可见性/健壮性护栏。
+/// 之所以不用 Mutex(二值信号量)：本 RTOS ABI 无真互斥量，二值信号量在 control(硬实时)
+/// 与 sensors(相邻更低优先级) 临界区被抢占的场景下争用不安全，会导致调度器损坏。
+pub static mut SENSOR_SEQ: u32 = 0;
 pub static mut EST_MTX: Mutex = Mutex::uninit();
 
 /* ===================== 任务栈 ===================== */
 
-const STACK_CTRL: usize = 3072; // 控制律含 EKF+PID，栈需求大
-const STACK_SENS: usize = 2048; // 采样含 I2C/UART 缓冲
-const STACK_TELEM: usize = 1536;
-const STACK_MON: usize = 1024;
+const STACK_CTRL: usize = 3072; // 控制律含 EKF+PID（当前回放 gps=None，真实 GPS 路径需更多，待数据就绪时再加）
+const STACK_SENS: usize = 3584; // 采样含回放+帧拷贝：实测峰值 > 3072（原靠 monitor 缓冲垫着才不崩），提到 3584 自洽
+const STACK_TELEM: usize = 1024; // 遥测格式化+串口写出，512 会溢出
 
 static mut STACK_CTRL_BUF: [u8; STACK_CTRL] = [0u8; STACK_CTRL];
 static mut STACK_SENS_BUF: [u8; STACK_SENS] = [0u8; STACK_SENS];
 static mut STACK_TELEM_BUF: [u8; STACK_TELEM] = [0u8; STACK_TELEM];
-static mut STACK_MON_BUF: [u8; STACK_MON] = [0u8; STACK_MON];
 
 /* ===================== 启动 ===================== */
 
@@ -126,8 +132,8 @@ pub fn spawn_flyctrl() {
 
     // 初始化互斥量（天花板优先级取可能锁定者的最高 prio）
     unsafe {
-        SENSOR_MTX.init(RTOS_PRIO_BH_HIGH); // sensors(5)/control(4) 都可能锁
-        EST_MTX.init(RTOS_PRIO_BH_HIGH);    // control(4)/telem(12)/monitor(14)
+        // SENSOR_FRAME 改用 seqlock（见 SENSOR_SEQ），不再需要 SENSOR_MTX。
+        EST_MTX.init(RTOS_PRIO_BH_HIGH);    // control(4)/telem(12)
     }
 
     // control：硬实时 prio=4, priv=1, RTOS_RT_HARD
@@ -166,18 +172,6 @@ pub fn spawn_flyctrl() {
         0,
         0,
     );
-    // monitor：prio=14, priv=1
-    spawn_rt(
-        b"monitor\0",
-        monitor::monitor_entry,
-        crate::abi::RTOS_PRIO_BLINK,
-        unsafe { STACK_MON_BUF.as_mut_ptr() },
-        STACK_MON,
-        1,
-        RT_NONE,
-        0,
-        0,
-    );
 
-    crate::info!(tag: "flyctrl", "spawned 4 tasks: control/sensors/telem/monitor");
+    crate::info!(tag: "flyctrl", "spawned 3 tasks: control/sensors/telem (monitor merged into telem)");
 }
