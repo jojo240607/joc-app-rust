@@ -90,21 +90,25 @@ impl EstState {
 /// 会落到 Flash，运行时写它即写 Flash → BusFault。故用 `#[link_section=".bss.est_state"]`
 /// 强制进 .bss，并用 `zeroed()` 作全零初始化器（Health::Healthy=0 为合法变体，zeroed 安全）；
 /// 真正的初值在 `spawn_flyctrl` 里运行时 `EST_STATE = EstState::empty()` 填充——写落 RAM 安全。
-#[link_section = ".bss.est_state"]
+/// 段名用 `.rust_bss`（独立顶层段，非 `.bss.*` 子类）以便主链接脚本把它收进 APP_RAM，
+/// 释放主 SRAM 给系统堆。
+#[link_section = ".rust_bss"]
 pub static mut EST_STATE: EstState = unsafe { core::mem::zeroed() };
 
 /// 全局共享帧 + 互斥量（静态存储，启动时 init）。
 /// 注意：与 `EST_STATE` 同理，`SensorFrame::empty()` 构造的 `Option<T>` 因无 niche，
 /// 其 padding 字节可能非零，会被 Rust 放入 `.data` 段而落到 Flash；sensors 任务写
-/// 它会触发 BusFault。故强制 `.bss.sensor_frame` + `zeroed()`（全零合法初值）。
-#[link_section = ".bss.sensor_frame"]
+/// 它会触发 BusFault。故强制 `.rust_bss` + `zeroed()`（全零合法初值）。
+#[link_section = ".rust_bss"]
 pub static mut SENSOR_FRAME: SensorFrame = unsafe { core::mem::zeroed() };
 /// 共享帧顺序计数器（seqlock）：sensors 写前+1(奇)、写后+1(偶)；control 读时校验
 /// 首尾 seq 相等且为偶即一致。control(prio4) > sensors(prio5)，读过程不会被 sensors
 /// 抢占，故无需 retry 也能保证原子；seq 仅作可见性/健壮性护栏。
 /// 之所以不用 Mutex(二值信号量)：本 RTOS ABI 无真互斥量，二值信号量在 control(硬实时)
 /// 与 sensors(相邻更低优先级) 临界区被抢占的场景下争用不安全，会导致调度器损坏。
+#[link_section = ".rust_bss"]
 pub static mut SENSOR_SEQ: u32 = 0;
+#[link_section = ".rust_bss"]
 pub static mut EST_MTX: Mutex = Mutex::uninit();
 
 /* ===================== 任务栈 ===================== */
@@ -113,14 +117,18 @@ const STACK_CTRL: usize = 3072; // 控制律含 EKF+PID（当前回放 gps=None�
 const STACK_SENS: usize = 3584; // 采样含回放+帧拷贝：实测峰值 > 3072（原靠 monitor 缓冲垫着才不崩），提到 3584 自洽
 const STACK_TELEM: usize = 1024; // 遥测格式化+串口写出，512 会溢出
 
+#[link_section = ".rust_bss"]
 static mut STACK_CTRL_BUF: [u8; STACK_CTRL] = [0u8; STACK_CTRL];
+#[link_section = ".rust_bss"]
 static mut STACK_SENS_BUF: [u8; STACK_SENS] = [0u8; STACK_SENS];
+#[link_section = ".rust_bss"]
 static mut STACK_TELEM_BUF: [u8; STACK_TELEM] = [0u8; STACK_TELEM];
 
 /* ===================== 启动 ===================== */
 
 /// 构建 "pwmN"（N=0..3）设备名（含结尾 \0）。
 pub(crate) fn make_name(n: u8) -> &'static [u8] {
+    #[link_section = ".rust_data"]
     static mut NAMES: [[u8; 5]; 4] = [*b"pwm0\0", *b"pwm1\0", *b"pwm2\0", *b"pwm3\0"];
     unsafe { &NAMES[n as usize] }
 }

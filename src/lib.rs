@@ -73,6 +73,7 @@ mod demo {
     use core::ffi::{c_char, c_void};
 
     // demo 任务独立栈（放 App RAM，1KB 足够周期日志）。
+    #[link_section = ".rust_bss"]
     static mut DEMO_STACK: [u8; 1024] = [0u8; 1024];
 
     extern "C" fn demo_task_entry(_arg: *mut c_void) {

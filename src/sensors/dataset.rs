@@ -76,5 +76,6 @@ impl Playback {
     }
 }
 
-/// 全局唯一回放实例（静态单例，置于 .bss，运行时由 `spawn_flyctrl` 之前构造）。
+/// 全局唯一回放实例（静态单例，置于 .rust_data，运行时由 `spawn_flyctrl` 之前构造）。
+#[link_section = ".rust_data"]
 pub static mut PLAYBACK: Playback = Playback::new();

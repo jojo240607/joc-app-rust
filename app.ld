@@ -57,11 +57,31 @@ SECTIONS
     . = ALIGN(4);
   } >APP_FLASH
 
-  /* ---- App 运行期 .bss（APP_RAM，系统加载器清零）---- */
+  /* ---- App 运行期 .data（非零初值，如 NAMES/PLAYBACK）---- */
+  /* 单 ELF(轨 A) 下由主链接脚本 .app_data 经 startup LMA 拷贝初始化；轨 B 下 App
+   * 镜像无独立加载器拷贝机制（系统加载器仅清零 APP_RAM），故此处把 .rust_data
+   * 也收进 .app_bss(NOLOAD) 清零——初值在轨 B 下被丢弃(与改造前 .data 行为一致)，
+   * 由 Rust 运行时重填，不影响功能。两路符号均不 undefined，链接安全。 */
+  .app_data :
+  {
+    . = ALIGN(4);
+    _sappdata = .;
+    *(.rust_data)
+    *(.rust_data.*)
+    . = ALIGN(4);
+    _eappdata = .;
+    _appdata_lma = LOADADDR(.app_data);
+  } >APP_RAM AT> APP_FLASH
+
+  /* ---- App 运行期 .bss（全零初值，如 EST_STATE/栈缓冲；系统加载器清零）---- */
   .app_bss (NOLOAD) :
   {
     . = ALIGN(4);
     _sappbss = .;
+    *(.rust_data)
+    *(.rust_data.*)
+    *(.rust_bss)
+    *(.rust_bss.*)
     *(.bss)
     *(.bss.*)
     *(COMMON)

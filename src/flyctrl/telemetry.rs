@@ -16,7 +16,7 @@ use crate::flyctrl::{EST_MTX, EST_STATE};
 
 /// 帧缓冲放在静态区（不占任务栈）。
 /// 遥测任务独占该缓冲，循环内串行复用，无需互斥。
-#[link_section = ".bss.telem_frame"]
+#[link_section = ".rust_bss"]
 static mut FRAME_BUF: [u8; flyctrl_core::comm::link::MAX_FRAME_LEN] =
     [0u8; flyctrl_core::comm::link::MAX_FRAME_LEN];
 
