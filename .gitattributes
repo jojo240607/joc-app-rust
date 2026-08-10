@@ -1,0 +1,18 @@
+# 统一行尾为 LF（跨平台协作标准；Rust/GDB/链接脚本对 CRLF 敏感）
+* text=auto eol=lf
+
+# 明确文本源类型
+*.rs    text
+*.ld    text
+*.py    text
+*.toml  text
+*.md    text
+*.gdb   text
+*.c     text
+*.h     text
+*.lock  text
+
+# 二进制/生成物：不转换行尾
+*.bin   binary
+*.elf   binary
+*.o     binary
