@@ -6,9 +6,9 @@
  *       magic=0x41504800("APH\0") / abi_version=RTOS_ABI_VERSION /
  *       entry=ABSOLUTE(rust_app_start) / app_size=0(占位) / reserved=0
  *   - App 代码 XIP 运行（.app_code 在 APP_FLASH，绝对地址），无需重定位。
- *   - App 运行期 .bss 在 APP_RAM（发布版 0x20007000，约 91KB），由系统加载器清零。
+ *   - App 运行期 .bss 在 APP_RAM（发布版 0x20004000，约 103KB），由系统加载器清零。
  *     该 ORIGIN/LENGTH 必须与 joc-base 链接脚本 APP_RAM 的注入值严格一致
- *     （发布版 RTOS_SELFTEST=OFF: 0x20007000 / 0x16C00；开发版不挂载真 App）。
+ *     （发布版 RTOS_SELFTEST=OFF: 0x20004000 / 0x19C00；开发版不挂载真 App）。
  *   - App 不使用 .data：所有带非零 const 初始化器的 static（如含非零 enum 判别式的
  *     EstState）一律用 `#[link_section=".bss.*"]` 强制进 .bss（初始化器被丢弃、由加载器
  *     清零），再在运行时填充，避免落入 Flash 导致写 BusFault。 */
@@ -16,7 +16,7 @@
 MEMORY
 {
   APP_FLASH (rx) : ORIGIN = 0x08060000, LENGTH = 384K
-  APP_RAM   (xrw): ORIGIN = 0x20007000, LENGTH = 0x16C00  /* 发布版：0x20007000..0x2001DC00 (约91KB)；须与 joc-base APP_RAM 注入值一致（紧跟系统 .bss __bss_end__=0x20006e08 之上，避免加载器清零时破坏 g_irq[]） */
+  APP_RAM   (xrw): ORIGIN = 0x20004000, LENGTH = 0x19C00  /* 发布版：0x20004000..0x2001DC00 (约103KB)；须与 joc-base APP_RAM 注入值一致（紧跟系统 .bss __bss_end__=0x20003608 之上，避免加载器清零时破坏 g_irq[]） */
 }
 
 /* 入口固定为 Rust 挂载点；header.entry 由链接器填其绝对地址 */
