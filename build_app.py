@@ -37,6 +37,7 @@ def check_tools():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="仅校验工具链")
+    ap.add_argument("--features", default="", help="cargo 构建 feature（如 usbtest/demo/real-sensors）")
     args = ap.parse_args()
 
     if not check_tools():
@@ -46,7 +47,10 @@ def main():
         return
 
     # 1) cargo -> libapp.a
-    run(["cargo", "build", "--target", TARGET, "--release"])
+    cargo_cmd = ["cargo", "build", "--target", TARGET, "--release"]
+    if args.features:
+        cargo_cmd += ["--features", args.features]
+    run(cargo_cmd)
     libapp = os.path.join(ROOT, "target", TARGET, "release", "libapp.a")
     if not os.path.exists(libapp):
         print(f"[ERR] 未找到 {libapp}", file=sys.stderr); sys.exit(1)

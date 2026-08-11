@@ -1,6 +1,9 @@
 //! 遥测下行任务（20ms 周期）：从最新估计发标准 MAVLink。
 //!
-//! 读 EST_STATE（经 EST_MTX），经 uart3 下行 heartbeat / local_pos / sys_status。
+//! 读 EST_STATE（经 EST_MTX），经 usb0(USB CDC) 单通道下行
+//! heartbeat / local_pos / sys_status。
+//!
+//! 注：uart3(USART6) 未接到 PC，无法闭环验证，故下行只用 usb0。
 
 use core::ffi::c_void;
 
@@ -9,7 +12,6 @@ use flyctrl_core::fdir::Health;
 
 use crate::abi::RTOS_PRIO_MAIN;
 use crate::device::Device;
-use crate::ioctl;
 use crate::{info, warn};
 use crate::rtos_sync::{msleep, tick_count};
 use crate::flyctrl::{EST_MTX, EST_STATE};
@@ -22,20 +24,24 @@ static mut FRAME_BUF: [u8; flyctrl_core::comm::link::MAX_FRAME_LEN] =
 
 /// 遥测下行任务入口。
 ///
-/// 下行通道优先级：USB CDC(`usb0`) > 串口(`uart3`)。USB CDC 是 CDC-ACM 虚拟串口，
-/// 电脑端免 USB-TTL 转接即可直接收到 MAVLink 流做仿真分析；仅当 USB 未枚举时回退
-/// 到 uart3（USART6）。usb0 与 C 侧 g_console(uart0) 相互独立，Rust 复用写数据不会
-/// 破坏控制台。写前用 `USB_IOCTL_CONNECTED` 探测枚举状态，未连接则跳过 usb、走 uart3。
+/// 下行通道：USB CDC(`usb0`) 单写。
+/// USB CDC 是 CDC-ACM 虚拟串口，电脑端免 USB-TTL 转接即可直接收 MAVLink 流做仿真分析。
+/// `usb_stream_write` 是非阻塞 staged 写：host 未连 / 未 IN-token 时 TX ring 填满后
+/// 仅返回 0（丢帧），绝不阻塞任务。因此**不**用 `USB_IOCTL_CONNECTED`(DTR 控制线) 来决定
+/// 是否写 usb0 —— 上位机开 COM9 但 DTR=False 时 conn 仍为 0，据此跳过会致上位机收不到
+/// 数据。正确做法是无条件写，host 一连即收。usb0 与 C 侧 g_console(uart0) 相互独立。
+///
+/// uart3(USART6) 未接到 PC，无法闭环验证，下行暂不挂 uart3（其 IRQ 引擎 write 为阻塞式，
+/// 一旦唤醒中断异常会永久卡死 telem；而 usb0 的非阻塞 staged 写天然满足"host 不连不卡死"）。
 pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
-    info!(tag: "telem", "task started; period=20ms prio={} downlink=usb0(uart3 fallback)", RTOS_PRIO_MAIN);
+    info!(tag: "telem", "task started; period=20ms prio={} downlink=usb0", RTOS_PRIO_MAIN);
 
-    let usb_dev = Device::open(b"usb0\0");
+    // usb0 复用系统层已在 boot 阶段 open 的句柄（Device::get），
+    // 切勿二次 Device::open —— 二次 open 会再次 USBD_Init + 重绑 ISR，
+    // 重置 USB TX 状态机导致后续 write 阻塞/卡死（已实测复现）。
+    let usb_dev = Device::get("usb0\0");
     if usb_dev.is_none() {
-        warn!(tag: "telem", "usb0 (USB CDC) not available -> MAVLink only via uart3");
-    }
-    let uart_dev = Device::open(b"uart3\0");
-    if uart_dev.is_none() {
-        warn!(tag: "telem", "uart3 (telemetry) not available -> no serial downlink");
+        warn!(tag: "telem", "usb0 (USB CDC) not available -> no downlink");
     }
 
     let mut frame_buf = unsafe { &mut FRAME_BUF };
@@ -51,26 +57,29 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
             armed = s.armed;
         }
 
-        // 下行通道选择：USB CDC 已枚举则优先 usb0，否则回退 uart3。
-        // 避免往未枚举的 USB 端点堆积数据（被驱动静默丢弃或占 TX 缓冲）。
-        let use_usb = usb_dev.as_ref().map_or(false, |d| {
-            let mut conn: i32 = 0;
-            d.ioctl(ioctl::USB_IOCTL_CONNECTED, &mut conn as *mut i32 as *mut c_void) == 0
-                && conn != 0
-        });
-        let downlink = if use_usb {
-            usb_dev.as_ref()
-        } else {
-            uart_dev.as_ref()
+        // 下行：USB CDC(usb0) 单通道写。
+        //
+        // 注意：USB CDC 的 usb_stream_write 是【非阻塞 staged】——host 未连 / 未 IN-token
+        // 时 TX ring 填满后 write 仅返回 0（丢帧），绝不阻塞任务（已实测验证）。
+        // 因此**不要**用 USB_IOCTL_CONNECTED(DTR 控制线) 决定是否写 usb0：上位机打开
+        // COM9 但 DTR=False（避免 CH340 复位）时 conn 仍为 0，若据此跳过 usb0 会导致
+        // 上位机连着 USB 却收不到 MAVLink。正确做法是无条件写，host 连上即收到。
+        let mut wrote_usb = 0i32;
+        let send = |d: &Device, fb: &mut [u8; flyctrl_core::comm::link::MAX_FRAME_LEN],
+                    seq: u8, est: &_, armed: bool, health_ok: bool| -> i32 {
+            let mut total = 0i32;
+            for n in [
+                mavlink::encode_heartbeat(0, armed, seq, fb),
+                mavlink::encode_local_pos_from(mavlink::SYS_ID, est, seq, fb),
+                mavlink::encode_sys_status(health_ok, seq, fb),
+            ] {
+                let k = d.write(&fb[..n]);
+                if k > 0 { total += k; }
+            }
+            total
         };
-
-        if let Some(d) = downlink {
-            let n = mavlink::encode_heartbeat(0, armed, seq, &mut frame_buf);
-            let _ = d.write(&frame_buf[..n]);
-            let n = mavlink::encode_local_pos_from(mavlink::SYS_ID, &est, seq, &mut frame_buf);
-            let _ = d.write(&frame_buf[..n]);
-            let n = mavlink::encode_sys_status(health != Health::Critical, seq, &mut frame_buf);
-            let _ = d.write(&frame_buf[..n]);
+        if let Some(d) = usb_dev.as_ref() {
+            wrote_usb = send(d, frame_buf, seq, &est, armed, health != Health::Critical);
         }
 
         seq = seq.wrapping_add(1);
@@ -98,8 +107,8 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
                 }
             }
             info!(tag: "telem",
-                  "hb seq={} ch={} imu/gps/baro={}/{}/{} sens_armed={} crit={} uptime={}ms",
-                  seq, if use_usb { "usb0" } else { "uart3" },
+                  "hb seq={} usb_wr={} imu/gps/baro={}/{}/{} sens_armed={} crit={} uptime={}ms",
+                  seq, wrote_usb,
                   imu_ok, gps_ok, baro_ok, sens_armed, health == Health::Critical, crate::rtos_sync::tick_count());
         }
 
