@@ -33,3 +33,7 @@ libm = "0.2"
 [features]
 default = []
 demo = []
+# 启用真实传感器驱动（I2C IMU/Baro/Mag + UART GPS/SBUS）替代虚拟回放源。
+# 默认关闭：使用 VirtualXxx 虚拟源，无需外接硬件即可闭环调试。
+# 构建：`cargo build --release --features real-sensors`（经 CMake RUST_APP_LIB 注入）。
+real-sensors = []

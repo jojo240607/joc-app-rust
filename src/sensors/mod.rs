@@ -1,20 +1,26 @@
-//! Rust 传感器驱动层：用 RTOS 总线（i2c0/spi0）组合具体传感器。
+//! Rust 传感器驱动层：用 RTOS 总线（i2c0/spi0/uart1/uart2）组合具体传感器。
 //!
-//! RTOS 层只提供总线/通用外设驱动；具体传感器设备由本层经总线构建：
-//! MPU6050 / BMP280 / QMC5883L via I2C，GPS via UART（降级），缺失则 SimImu 模拟源。
+//! 分层：
+//! - `sim/`  模拟（回放）传感器集合：从全局 `PLAYBACK` 数据集读取，无需外接硬件即可调试。
+//! - `imu/` `baro/` `mag/` `gps/` `rc/`  真实硬件驱动，按物理类型分目录，
+//!   每类下每种型号一个子模块（如 `imu/mpu6050.rs`、`gps/ublox.rs`），
+//!   后续接不同型号传感器时新增子模块即可，互不影响。
+//! - `stack.rs`  统一封装：虚拟/真实编译期切换（`cfg(feature = "real-sensors")`），
+//!   算法/控制/遥测层只依赖 trait，不感知底层来源。
+//! - `dataset.rs` `dataset_data.rs`  虚拟回放数据集（支撑 `sim/`）。
 
-pub mod baro_bmp280;
+pub mod baro;
 pub mod dataset;
-pub mod gps_ublox;
-pub mod imu_mpu6050;
-pub mod mag_qmc5883;
-pub mod rc_sbus;
-pub mod sim_imu;
-pub mod virtual_sensors;
+pub mod gps;
+pub mod imu;
+pub mod mag;
+pub mod rc;
+pub mod sim;
+pub mod stack;
 
-pub use baro_bmp280::BaroBmp280;
-pub use gps_ublox::GpsUblox;
-pub use imu_mpu6050::ImuMpu6050;
-pub use mag_qmc5883::MagQmc5883;
-pub use rc_sbus::RcSbus;
-pub use sim_imu::SimImu;
+pub use baro::BaroBmp280;
+pub use gps::GpsUblox;
+pub use imu::ImuMpu6050;
+pub use mag::MagQmc5883;
+pub use rc::RcSbus;
+pub use sim::SimImu;

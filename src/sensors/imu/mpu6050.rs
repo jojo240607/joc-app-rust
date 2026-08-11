@@ -4,6 +4,7 @@
 
 use core::ffi::c_void;
 
+use flyctrl_core::hal::sensor::ImuSensor;
 use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond};
 use flyctrl_core::vehicle::ImuSample;
 
@@ -13,6 +14,7 @@ use crate::ioctl;
 pub struct ImuMpu6050 {
     bus: Device,
     addr: u16,
+    healthy: bool,
 }
 
 impl ImuMpu6050 {
@@ -21,7 +23,7 @@ impl ImuMpu6050 {
 
     pub fn new(bus_name: &[u8], addr: u16) -> Option<Self> {
         let bus = Device::open(bus_name)?;
-        let s = Self { bus, addr };
+        let s = Self { bus, addr, healthy: true };
         // 唤醒（清零 PWR_MGMT_1 的 SLEEP 位）
         let mut tx = [Self::PWR_MGMT_1, 0x00];
         let mut w = I2cXfer { addr, buf: tx.as_mut_ptr(), len: 2, result: 0 };
@@ -34,7 +36,7 @@ impl ImuMpu6050 {
     }
 
     /// 读 6 轴（14 字节：accel3×2 + 温度2 + gyro3×2），解析为 `ImuSample`。
-    pub fn read(&self) -> Option<ImuSample> {
+    pub fn read_raw(&self) -> Option<ImuSample> {
         let mut raw = [0u8; 14];
         if i2c_write_read(&self.bus, self.addr, Self::ACCEL_XOUT_H, &mut raw) != 0 {
             return None;
@@ -53,5 +55,24 @@ impl ImuMpu6050 {
                 RadianPerSecond(g(12) / 131.0 * core::f32::consts::PI / 180.0),
             ],
         })
+    }
+}
+
+impl ImuSensor for ImuMpu6050 {
+    fn read(&mut self) -> ImuSample {
+        match self.read_raw() {
+            Some(s) => s,
+            None => {
+                self.healthy = false;
+                ImuSample {
+                    accel: [MeterPerSecondSquared(0.0); 3],
+                    gyro: [RadianPerSecond(0.0); 3],
+                }
+            }
+        }
+    }
+
+    fn healthy(&self) -> bool {
+        self.healthy
     }
 }
