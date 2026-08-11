@@ -354,6 +354,31 @@ python listen.py                  # 纯监听，open 后手动按复位键
 - 依赖：`run_app.py` 需 OpenOCD（路径硬编码在脚本顶部 `OCD_DIR`）+ `arm-none-eabi-gdb`（PATH）；
   `listen.py` 仅需 `pyserial`。
 
+#### 正确抓打印姿势（已实机验证的可靠流程）
+
+板子正常运行时，**App 周期日志（心跳 `hb` / sensor loop）是持续吐到 COM8 的**，所以
+"抓启动日志"不需要复位——直接监听运行中板子即可。最稳的命令：
+
+```sh
+cd joc-app-rust
+python listen.py COM8 115200 15 > cap.txt 2>&1   # 前台直接跑 + 重定向到文件
+type cap.txt                                      # 看结果（TOTAL>0 即成功）
+```
+
+要点 / 踩坑（实机踩过）：
+
+1. **不要用 `start "win" python listen.py ... > file` 套一层启动**。`cmd` 的 `start` 会把
+   重定向符作用在 `start` 命令本身而非被启动的 python 进程，结果是**弹窗里有输出、文件却是
+   空的**（只有 listen.py 自己的 stderr 提示）。必须**直接前台** `python listen.py ... > file`。
+2. **板子已经在跑就别再 `monitor reset`**。`flash_app.py` 末尾 `monitor reset halt` 会把板子
+   停在 halt 态（USB CDC 不枚举、COM9 不出现），需先 `monitor reset run` 救活；但救活后
+   启动 banner 已在 halt 前吐过一次，**再 reset 也不重打 boot**（reset run 是从当前 PC 续跑，
+   不是冷启动重初始化）。所以：要么复位前就 open 住端口，要么干脆不复位、直接听运行期日志。
+3. **串口被别的进程占用会读 0 字节**：若你用串口助手开着 COM8，pyserial 虽能 `open` 成功，但
+   Windows 把数据给了前台句柄，python 侧读到 0。确认 `TOTAL=0` 先查端口占用（关掉串口助手）。
+4. 实机确认：纯监听 15s 可稳定抓到 ~3.2KB 的 `R/I ... ctrl: hb seq=...` + `R/I ... sensor: loop ...`
+   实时日志，证明 App 已挂载且飞控在跑（见 §4.1 输出示例同款）。
+
 ### 4.2 烧录一条龙（本工程脚本）
 
 `flash.py` 把 OpenOCD 路径、系统镜像路径都硬编码在脚本顶部，在本工程目录即可一条龙烧录
@@ -422,6 +447,12 @@ pc  0x8060094  <rust_app_start+20>
 - **`run_app.py` 输出 0 字节**：ST-Link `monitor reset run` 在部分板子上与 CH340 缓冲不同步，
   抓不到启动打印（但板子在跑）。改用 `listen.py` 并在其 open 端口后**手动按板子复位键**，
   即可稳定捕获（与 §4.1 示例同一来源）。
+- **`start "win" python listen.py ... > file` 文件为空**：`cmd` 的 `start` 把重定向作用在
+  `start` 自身而非 python 子进程，弹窗有输出、文件为空。务必**直接前台**运行
+  `python listen.py ... > file`（见 §4.1b「正确抓打印姿势」）。
+- **先 halt 再 `monitor reset run` 抓不到启动 banner**：reset run 是从 halt 处续跑，不重跑
+  boot 初始化，早期启动打印已流失。要抓 boot 日志必须**在 open 端口后再冷复位**（或干脆
+  不复位、直接听运行期周期日志，App 心跳/loop 日志持续输出）。
 - **链接报 undefined reference to `rust_app_start`**：CMake 没注入 `RUST_APP_LIB=1` 宏，
   导致 C 侧 `#ifdef RUST_APP_LIB` 分支为假、`g_app_slot.app_start` 未赋值 → libapp.a 被 gc 裁掉。
 - **`rust_app_start` 返回前断言 version 不符**：`RTOS_ABI_VERSION`（`g_app_slot.version`）与
