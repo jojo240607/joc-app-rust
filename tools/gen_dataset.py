@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-生成 src/sensors/dataset_data.rs —— 虚拟传感器回放数据集。
+生成 src/sensors/sim/dataset_data.rs —— 虚拟传感器回放数据集。
 
 默认：生成一段"真实形态"的机动飞行合成片段（起飞→悬停→小幅机动→下降→落地），
       加速度/角速度/气压高度/GPS/RC 量级贴近真实四旋翼，确定性可复现。
@@ -19,7 +19,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "..", "src", "sensors", "dataset_data.rs")
+OUT = os.path.join(HERE, "..", "src", "sensors", "sim", "dataset_data.rs")
 
 # 起点经纬度（随便选一个真实坐标，仅用于 GPS 位移相对量）
 LAT0 = 37.4275

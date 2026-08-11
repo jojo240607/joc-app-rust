@@ -7,7 +7,7 @@ use flyctrl_core::hal::sensor::GpsSensor;
 use flyctrl_core::units::Meter;
 use flyctrl_core::vehicle::PosSample;
 
-use crate::sensors::dataset::{
+use crate::sensors::sim::dataset::{
     Frame, GPS_ORIGIN, METERS_PER_DEG_LAT, METERS_PER_DEG_LON, PLAYBACK,
 };
 

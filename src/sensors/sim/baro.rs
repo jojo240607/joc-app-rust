@@ -6,7 +6,7 @@
 use flyctrl_core::hal::sensor::BaroSensor;
 use flyctrl_core::units::Meter;
 
-use crate::sensors::dataset::{Frame, PLAYBACK};
+use crate::sensors::sim::dataset::{Frame, PLAYBACK};
 
 pub struct VirtualBaro;
 

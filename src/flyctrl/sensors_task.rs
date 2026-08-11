@@ -46,7 +46,7 @@ impl Sensors {
             // 虚拟回放模式下，每个采样周期推进一次全局读指针（四类数据同步对齐）。
             #[cfg(not(feature = "real-sensors"))]
             unsafe {
-                crate::sensors::dataset::PLAYBACK.advance(sample_dt);
+                crate::sensors::sim::dataset::PLAYBACK.advance(sample_dt);
             }
 
             // ---- 读取各类传感器（统一 trait 接口，不区分虚拟/真实）----

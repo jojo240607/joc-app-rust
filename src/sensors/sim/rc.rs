@@ -6,7 +6,7 @@
 use flyctrl_core::hal::sensor::RcReceiver;
 use flyctrl_core::vehicle::RcInput;
 
-use crate::sensors::dataset::{Frame, PLAYBACK};
+use crate::sensors::sim::dataset::{Frame, PLAYBACK};
 
 /// 虚拟数据闭环演示开关：虚拟 RC 强制 `armed=true`，使控制律 PID→PWM 闭环真正执行。
 /// 数据集 `rc` 通道无 armed 位，正常回放语义应为 false（飞控不输出推力）。

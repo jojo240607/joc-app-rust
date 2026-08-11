@@ -7,7 +7,7 @@ use flyctrl_core::hal::sensor::ImuSensor;
 use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond};
 use flyctrl_core::vehicle::ImuSample;
 
-use crate::sensors::dataset::{Frame, PLAYBACK};
+use crate::sensors::sim::dataset::{Frame, PLAYBACK};
 
 /// IMU 加速度计测量的是"比力"（含重力），而 `ImuSample.accel` 语义为机体加速度（不含重力）。
 /// 数据集里的 `imu_accel` 为含重力值，这里减去近水平的重力分量得到比力。
