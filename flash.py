@@ -9,7 +9,9 @@
   - OpenOCD: D:/soft/openocd/openocd-4e78563-i686-w64-mingw32
   - 系统镜像: ../joc-base/build_rel/stm32f407_minimal.bin
     （joc-base 用 build_rel.bat / -DRTOS_SELFTEST=OFF 生成；其分区
-     APP_RAM=0x20006000/0x17C00、APP_SLOT=0x2001DC00 与 app.ld 一致）
+     APP_RAM=0x20004000/0x1BC00、APP_SLOT=0x2001FC00、APP_FLASH=0x08060000
+     与 app.ld 严格一致。注意：该发布镜像【不含】RUST_APP_LIB 注入，
+     启动走 b 轨 app_slot_load_app() 从 0x08060000 加载独立 app.bin）
   - 交叉工具: arm-none-eabi-gdb (需在 PATH)
 """
 import subprocess, sys, os, time, signal

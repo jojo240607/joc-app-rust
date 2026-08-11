@@ -70,7 +70,8 @@ pub extern "C" fn rust_app_start() -> i32 {
 mod demo {
     use crate::abi::*;
     use crate::info;
-    use core::ffi::{c_char, c_void};
+    use crate::rtos_sync::{spawn_rt, RT_NONE};
+    use core::ffi::c_void;
 
     // demo 任务独立栈（放 App RAM，1KB 足够周期日志）。
     #[link_section = ".rust_bss"]
@@ -80,24 +81,25 @@ mod demo {
         let mut n: u32 = 0;
         loop {
             n = n.wrapping_add(1);
-            info!(tag: "demo", "demo task alive seq={} ticks={}", n,
-                  unsafe { (*core::ptr::addr_of!(g_app_slot)).tick_count.map(|f| f()).unwrap_or(0) });
-            unsafe { rtos_msleep(500); }
+            info!(tag: "demo", "demo task alive seq={} ticks={}", n, crate::rtos_sync::tick_count());
+            crate::rtos_sync::msleep(500);
         }
     }
 
     pub fn spawn_demo() {
-        let name = b"demo_app\0".as_ptr() as *const c_char;
+        // 经 g_app_slot 间接创建任务（与 flyctrl 一致，不直接引用裸 RTOS 符号，
+        // 否则 App 独立链接时 rtos_msleep/rtos_task_create_rt 找不到定义）。
         unsafe {
-            rtos_task_create_rt(
-                name,
+            spawn_rt(
+                b"demo_app\0",
                 demo_task_entry,
-                core::ptr::null_mut(),
                 RTOS_PRIO_BH_MED, // 中优先，不抢硬实时
-                DEMO_STACK.as_mut_ptr() as *mut c_void,
+                DEMO_STACK.as_mut_ptr(),
                 DEMO_STACK.len(),
                 1, // priv=1：App 任务保持特权，与正式 flyctrl 一致
-                core::ptr::null(),
+                RT_NONE,
+                0,
+                0,
             );
         }
         info!(tag: "demo", "demo task spawned (link verified)");

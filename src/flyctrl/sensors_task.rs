@@ -24,7 +24,7 @@ use crate::abi::g_app_slot;
 /// 默认开启虚拟回放（板载无传感器时让飞控闭环真实形态运行）。
 const USE_PLAYBACK: bool = true;
 /// 诊断：是否把回放数据写入共享 SENSOR_FRAME。false 时控制环回退到 SimImu。
-const WRITE_FRAME: bool = true;
+const WRITE_FRAME: bool = false;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -36,7 +36,7 @@ impl Sensors {
     }
 
     pub extern "C" fn entry(_arg: *mut c_void) {
-        info!(tag: "sensor", "task started");
+        info!(tag: "sensor", "task started (WRITE_FRAME={})", WRITE_FRAME as u32);
 
         // 采样周期（秒），与回放推进一致。
         let sample_dt: f32 = 0.002; // 500Hz 采样
@@ -157,7 +157,9 @@ impl Sensors {
                 first = false;
             }
             loop_cnt += 1;
-            if loop_cnt % 50 == 0 {
+            // 低频心跳（每 500 loop 一次）：高频连续 info! 会令 uart0 dev_write 在 TX ring
+            // 满时阻塞（见诊断——950 卡死根因），生产代码不应周期密集打印。
+            if loop_cnt % 500 == 0 {
                 info!(tag: "sensor", "loop {} gps_w={} imu_w={} baro_w={}",
                       loop_cnt, gps_sample.is_some(), imu_sample.is_some(), baro_sample.is_some());
             }
