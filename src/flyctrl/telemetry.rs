@@ -13,7 +13,10 @@ use flyctrl_core::fdir::Health;
 use crate::abi::RTOS_PRIO_MAIN;
 use crate::device::Device;
 use crate::{info, warn};
-use crate::rtos_sync::{msleep, tick_count};
+use crate::rtos_sync::msleep;
+// [BISECT] 暂时隔离 uplink 依赖
+// use core::sync::atomic::Ordering;
+// use crate::flyctrl::uplink::G_CMD_MODE;
 use crate::flyctrl::{EST_MTX, EST_STATE};
 
 /// 帧缓冲放在静态区（不占任务栈）。
@@ -65,11 +68,13 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
         // COM9 但 DTR=False（避免 CH340 复位）时 conn 仍为 0，若据此跳过 usb0 会导致
         // 上位机连着 USB 却收不到 MAVLink。正确做法是无条件写，host 连上即收到。
         let mut wrote_usb = 0i32;
+        // [BISECT] 暂时隔离 uplink 模式反射，custom_mode 固定 0
+        let cmd_mode = 0u8;
         let send = |d: &Device, fb: &mut [u8; flyctrl_core::comm::link::MAX_FRAME_LEN],
-                    seq: u8, est: &_, armed: bool, health_ok: bool| -> i32 {
+                    seq: u8, est: &_, armed: bool, health_ok: bool, mode: u8| -> i32 {
             let mut total = 0i32;
             for n in [
-                mavlink::encode_heartbeat(0, armed, seq, fb),
+                mavlink::encode_heartbeat(mode, armed, seq, fb),
                 mavlink::encode_local_pos_from(mavlink::SYS_ID, est, seq, fb),
                 mavlink::encode_sys_status(health_ok, seq, fb),
             ] {
@@ -79,7 +84,7 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
             total
         };
         if let Some(d) = usb_dev.as_ref() {
-            wrote_usb = send(d, frame_buf, seq, &est, armed, health != Health::Critical);
+            wrote_usb = send(d, frame_buf, seq, &est, armed, health != Health::Critical, cmd_mode);
         }
 
         seq = seq.wrapping_add(1);

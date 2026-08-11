@@ -13,9 +13,13 @@ use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, VehicleState};
 
 use crate::abi::RTOS_PRIO_BH_HIGH;
 use crate::device::Device;
+// [BISECT] 暂时隔离 uplink 依赖
+// use crate::flyctrl::uplink::{G_CMD_ARMED, G_CMD_MODE};
 use crate::ioctl;
 use crate::{info, warn};
 use crate::rtos_sync::msleep;
+// [BISECT] 恢复 atomic import（供 set_cmd_* 使用 Ordering）
+use core::sync::atomic::Ordering;
 use crate::sensors::SimImu;
 
 /// 诊断开关：开启后会在启动前几圈打印大量 dbg 行，极易压垮开机瞬间的
@@ -23,6 +27,20 @@ use crate::sensors::SimImu;
 /// 正常验证时关闭。
 const VERBOSE: bool = false;
 use crate::flyctrl::{make_name, EST_MTX, EST_STATE, SENSOR_FRAME, SENSOR_SEQ};
+
+// [BISECT] 恢复指令接口（仅 store 原子变量，供 uplink 调用），但 control 主循环暂不读取，
+// 用于隔离 spawn 本身 vs uplink_task 内部 usb0 操作。
+/// 上行指令解锁：地面站经 COMMAND_LONG(ARM/DISARM) 设置。
+/// 与控制律内部 RC 解锁做逻辑或（任一为真即解锁）。
+pub fn set_cmd_armed(arm: bool) {
+    crate::flyctrl::uplink::G_CMD_ARMED.store(arm, Ordering::Relaxed);
+}
+
+/// 上行指令模式：地面站经 COMMAND_LONG(DO_SET_MODE) 设置。
+/// telemetry 心跳 custom_mode 会读取此值反映当前模式。
+pub fn set_cmd_mode(mode: u16) {
+    crate::flyctrl::uplink::G_CMD_MODE.store(mode, Ordering::Relaxed);
+}
 
 /// 控制律硬实时任务入口。
 pub extern "C" fn control_entry(_arg: *mut c_void) {
@@ -76,6 +94,8 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 if s1 == s2 { break; } // 首尾一致，读取完整
             }
         }
+        // [BISECT] 暂时隔离 uplink 指令解锁逻辑，恢复纯 RC 解锁
+        let armed_eff = armed;
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: sen-mtx got"); }
 
         // IMU 缺失 → 模拟源（总线异常降级）
@@ -92,10 +112,11 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         let health: Health = fdir.update(&imu_sample, gps.is_some(), baro_alt.is_some(), mag_ok);
 
         // 解锁瞬间锁定高度基准
-        if armed && !alt_locked {
+        // [BISECT] armed_eff 已退化为 armed
+        if armed_eff && !alt_locked {
             hold_alt = est.pos[2];
             alt_locked = true;
-        } else if !armed {
+        } else if !armed_eff {
             alt_locked = false;
         }
 
@@ -109,7 +130,8 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         };
 
         // --- 控制律（armed 且链路健康才输出推力） ---
-        let cmd = if armed && rc.fresh && !fdir.critical() {
+        // [BISECT] armed_eff 退化为 armed
+        let cmd = if armed_eff && rc.fresh && !fdir.critical() {
             pid.control(dt, &setpoint, &est)
         } else {
             ActuatorCmd::zero()
@@ -140,7 +162,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: in est-guard"); }
             let s = unsafe { &mut *core::ptr::addr_of_mut!(EST_STATE) };
             if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-addr got"); }
-            s.armed = armed;
+            s.armed = armed_eff; // [BISECT] 退化为 armed
             if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-armed written"); }
             s.est = est;
             s.health = health;

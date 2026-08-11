@@ -72,6 +72,8 @@ pub extern "C" fn rust_app_start() -> i32 {
         //  - demo feature：极简打日志任务，不碰任何外设，仅验证拉起链路；
         //  - usbtest feature：隔离验证 usb0 写通道是否通畅（不碰 EST_MTX/传感器）；
         //  - 默认：正式飞控多任务（采样/控制/遥测/监控，经 RTOS 设备 vtable）。
+        #[cfg(feature = "demo")]
+        crate::demo::spawn_demo();
         #[cfg(feature = "usbtest")]
         crate::usbtest::start();
         #[cfg(not(any(feature = "demo", feature = "usbtest")))]

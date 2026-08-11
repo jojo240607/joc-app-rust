@@ -29,9 +29,6 @@ use core::ffi::c_void;
     extern "C" fn usbtest_task_entry(_arg: *mut c_void) {
         // 系统层 boot 时已 open 过 usb0（作为第二控制台）。这里【只 get 不 open】，
         // 避免 App 二次 USBD_Init 触发 USBRST 把 connected 清 0 且重枚举失败。
-        // （这正是之前 telem 下行不通的根因候选：二次 open → USBRST → host 未重新
-        //  configured → connected 永久 0 → bulk_tx_pending 卡死 → TX ring 填满 →
-        //  后续 write 返回 0。）
         let usb = Device::get("usb0\0");
         info!(tag: "usbtest", "usb0 get = {}",
               if usb.is_some() { "ok" } else { "NULL" });
@@ -56,27 +53,21 @@ use core::ffi::c_void;
             line[len] = b'\r'; len += 1;
             line[len] = b'\n'; len += 1;
 
-            // 经 usb0 写；记录返回值 + connected 状态。
-            // 注意：USB_IOCTL_CONNECTED 的语义是【把 connected 写入 arg 指向的 int，
-            // 函数本身返回 0】。所以真正的连接标志在 c（arg_out），不是 conn（返回值）。
-            let mut wr = -1i32;
-            let mut conn_arg: i32 = -1;
-            let mut conn_rc: i32 = -1;
+            // 经 usb0 写，验证下行数据通道。
+            // 关键：只 write，绝不调用任何 ioctl（USB_IOCTL_CONNECTED / USB_IOCTL_DBG_DUMP）。
+            // 之前实测：App 每 200ms 反复 ioctl 查询会干扰系统层 USB 驱动状态机，
+            // 导致 host 打开 COM 口（SetCommState → SET_LINE_CODING）时 EP0 控制传输
+            // 失败 → Windows 报 error 31。write 本身是干净的（只进 TX staging ring，
+            // 由 usb_tx_pump 后台发送），不碰 EP0/控制传输，不会干扰 host 枚举/打开。
+            // write 返回值为负/0 表示未连接或 TX 满，属于正常背压，不阻塞本任务。
+            let mut wr: i32 = -1;
             if let Some(dev) = &usb {
                 wr = dev.write(&line[..len]);
-                conn_rc = dev.ioctl(ioctl::USB_IOCTL_CONNECTED, &mut conn_arg as *mut i32 as *mut c_void);
             }
 
             // uart0 镜像：每轮状态，便于无 COM9 时也能看任务在跑。
-            info!(tag: "usbtest", "seq={} usb_wr={} conn={} rc={} ticks={}",
-                  seq, wr, conn_arg, conn_rc, ticks);
-
-            // 每 40 轮打印一次 USB 驱动内部状态（connected/config/tx_ring/pending/EP）。
-            if seq % 40 == 0 {
-                if let Some(dev) = &usb {
-                    dev.ioctl(ioctl::USB_IOCTL_DBG_DUMP, core::ptr::null_mut());
-                }
-            }
+            info!(tag: "usbtest", "seq={} usb_wr={} ticks={}",
+                  seq, wr, ticks);
 
             msleep(200);
         }
