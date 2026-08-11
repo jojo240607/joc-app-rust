@@ -8,6 +8,13 @@
 #![no_std]
 #![allow(static_mut_refs)]
 
+// 链接脚本（app.ld）提供的 .data 段边界符号（LMA=Flash 初值地址，VMA=RAM 运行地址）。
+extern "C" {
+    static _appdata_lma: u8;
+    static mut _sappdata: u8;
+    static mut _eappdata: u8;
+}
+
 pub mod abi;
 pub mod device;
 pub mod ioctl;
@@ -35,6 +42,16 @@ fn report_mounted() {
 #[no_mangle]
 pub extern "C" fn rust_app_start() -> i32 {
     unsafe {
+        // 初始化 .data：把 Flash LMA 处的初值拷贝到 RAM VMA。
+        // 系统加载器仅清零 App .bss，不拷贝 .data；App 独立镜像必须自拷贝，
+        // 否则所有非零 const 初值（如 make_name 的 NAMES 数组）在 RAM 中全为 0。
+        let src = _appdata_lma as *const u8;
+        let dst = _sappdata as *mut u8;
+        let n = (_eappdata as usize) - (_sappdata as usize);
+        for i in 0..n {
+            *dst.add(i) = *src.add(i);
+        }
+
         let slot = &mut *core::ptr::addr_of_mut!(g_app_slot);
 
         // 双重防御：版本不符直接拒绝挂载（build.rs 已做链接期校验）

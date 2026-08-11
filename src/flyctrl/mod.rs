@@ -127,10 +127,19 @@ static mut STACK_TELEM_BUF: [u8; STACK_TELEM] = [0u8; STACK_TELEM];
 /* ===================== 启动 ===================== */
 
 /// 构建 "pwmN"（N=0..3）设备名（含结尾 \0）。
+///
+/// 注意：不能用带非零初值的 `static NAMES`（`.rust_data`）——App 独立镜像的
+/// `.data` 初值未被可靠打包进 app.bin（LMA 偏移超出 bin 长度），运行时自拷贝
+/// 读到的全是 0，导致 `Device::open("pwm0")` 用空名字查表失败。改为直接返回
+/// 字符串字面量（落在 `.rodata`，XIP 只读、无需拷贝，已被验证可靠）。
 pub(crate) fn make_name(n: u8) -> &'static [u8] {
-    #[link_section = ".rust_data"]
-    static mut NAMES: [[u8; 5]; 4] = [*b"pwm0\0", *b"pwm1\0", *b"pwm2\0", *b"pwm3\0"];
-    unsafe { &NAMES[n as usize] }
+    match n {
+        0 => b"pwm0\0",
+        1 => b"pwm1\0",
+        2 => b"pwm2\0",
+        3 => b"pwm3\0",
+        _ => b"\0",
+    }
 }
 
 /// 初始化共享互斥量并创建四任务。由 lib.rs::rust_app_start 调用。

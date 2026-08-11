@@ -78,8 +78,6 @@ SECTIONS
   {
     . = ALIGN(4);
     _sappbss = .;
-    *(.rust_data)
-    *(.rust_data.*)
     *(.rust_bss)
     *(.rust_bss.*)
     *(.bss)
