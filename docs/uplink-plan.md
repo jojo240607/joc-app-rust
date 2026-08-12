@@ -134,10 +134,16 @@ pub static mut G_PARAM_TX_IDX: i16 = -1;    // PARAM 流水应答游标；-1=空
 - 用途：板子复位后跑它，验证 (a) 板载下行被正确解析；(b) 发 ARM 后板载回 COMMAND_ACK 且心跳 base_mode 置 ARM 位；(c) 发 PARAM_REQUEST_LIST 后收到 6 个 PARAM_VALUE。
 
 ### 步骤 6：端到端验证（真硬件，~1h）
-1. 板子 reset run → `_verify.py` 确认 `uplink: task started` + telem hb 正常（不卡死）。
-2. PC 开 COM9，跑 `tools` 无头 CLI（duration 15s）：确认收到 HEARTBEAT/LOCAL_POSITION_NED/SYS_STATUS；发 PARAM_REQUEST_LIST 后收齐 6 个 PARAM_VALUE；发 ARM 后收 COMMAND_ACK(result=0) 且下一心跳 base_mode 含 ARM 位（telemetry 经 `G_CMD_MODE` 不受影响，armed 来自 `G_CMD_ARMED`）。
-3. （可选）关 COM9 句柄，确认 telem 仍跑（usb_wr=0 丢帧不卡死，任务1 回归）。
+1. 板子 reset run → `python tools/capture_log.py COM8` 确认 `uplink: task started` + telem hb 正常（不卡死）。
+2. PC 开 USB CDC 端口（ST VCP，自动探测或 `--port COM12`），跑 `python tools/verify_downlink.py`（确认收到
+   HEARTBEAT/LOCAL_POSITION_NED/SYS_STATUS 且 CRC 全对、seq 连续）；发指令用 `python tools/verify_uplink.py --arm`
+   收 ARM 后下一心跳 base_mode 含 ARM 位（telemetry 经 `G_CMD_MODE` 不受影响，armed 来自 `G_CMD_ARMED`）。
+3. （可选）关 CDC 句柄，确认 telem 仍跑（usb_wr=0 丢帧不卡死，任务1 回归）。
 4. 接地面站 GCS（真 GUI 或经 tools 的逻辑）：看能否识别飞控、列参数、点解锁（仅改标志，PWM 实际解锁需 RC 或后续安全门）。
+
+> 常驻联调工具（见 `tools/`）：`mavlink.py`(共享 CRC/解析) · `verify_downlink.py`(下行严格校验) ·
+> `verify_uplink.py`(上行+ARM) · `dump_usb.py`(原始字节诊断) · `usb_telemetry.py`(实时接收/CSV) ·
+> `capture_log.py`(UART 启动日志抓取)。
 
 ---
 
@@ -190,7 +196,7 @@ pub static mut G_PARAM_TX_IDX: i16 = -1;    // PARAM 流水应答游标；-1=空
 - [x] **`mod.rs` 注册**：`pub mod uplink;` + `STACK_UPLINK=1024` 静态栈 + `spawn_rt(b"uplink\0", ..., prio=10, ...)`。
 - [x] **`telemetry.rs` 接入**：心跳 `custom_mode` 反映 `G_CMD_MODE.load()`。
 - [x] **编译验证**：`cargo build --target thumbv7em-none-eabihf --release` 通过；`build_app.py` 生成 `app.bin` = 97448 B（< 384 KB 上限），链接无误。
-- [x] **`flyctrl-core` COMMAND_ACK CRC 修复**：`mavlink.rs` 的 `CRC_EXTRA` 表补 `COMMAND_ACK(77)=208`（原缺省 0），使标准地面站（mavlink 0.11）能正确校验板载发出的 COMMAND_ACK 帧，消除 §1 缺口 4 的链路层隐患。
+- [x] **`flyctrl-core` COMMAND_ACK CRC 修复**：`mavlink.rs` 的 `CRC_EXTRA` 表补 `COMMAND_ACK(77)=143`（标准 common.xml；早期误用 208 已回退），使标准地面站（mavlink 0.11）能正确校验板载发出的 COMMAND_ACK 帧，消除 §1 缺口 4 的链路层隐患。
 - [x] **`groundctrl/tools` 无头 CLI（计划 §4 步骤 5）**：重写 `tools/src/main.rs` 为无头地面站——`tokio` + `SerialLink` 连串口、`MavlinkParser::feed` 解析下行、统计心跳/参数/ACK 并退出汇总；支持 `--send-cmd ARM|DISARM|SET_MODE=<n>` / `--send-param NAME=VAL` / `--request-params` / `--port` / `--baud` / `--duration`。`tools/Cargo.toml` 加 `mavlink` + `tracing-subscriber` 依赖。`cargo check -p groundctrl-tools` 通过。
 
 ### 7.2 待验证（需真硬件 / PC 工具）
