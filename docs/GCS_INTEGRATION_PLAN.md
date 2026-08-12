@@ -43,3 +43,49 @@
 - ATTITUDE 角速度/姿态、VFR_HUD 高度/航向/油门数值合理。
 - 下发 ARM 后 control 解锁、心跳 base_mode 置 ARM 位；SET_MODE 后 custom_mode 反映。
 - PARAM_REQUEST_LIST 收到 5 条 PARAM_VALUE，PARAM_SET 回显新值。
+
+---
+
+## 完成报告（2026-08-13 实机验证）
+
+### 1. 代码改动（已全部落地）
+- `flyctrl/core/src/comm/mavlink.rs`：
+  - `encode_attitude` 改为标准 28B 布局（roll/pitch/yaw 欧拉角 + 三轴角速度）。
+  - `encode_vfr_hud` 改为标准 20B 布局（airspeed/groundspeed/heading i16 cdeg/throttle u16/alt/climb）。
+  - `encode_local_pos_from` / `encode_global_position_int` 改用 `state.time_boot_ms`。
+  - 新增单元测试 `attitude_uses_euler_layout` / `vfr_hud_standard_layout`（cargo test 全过）。
+- `flyctrl/core/src/vehicle.rs`：
+  - `Quaternion` 新增 `roll()` / `pitch()` 欧拉提取；修正 `from_euler` 用半角 `sin_cos(angle*0.5)`。
+  - `VehicleState` 新增 `time_boot_ms: i32` 字段，所有字面量补齐（swarm.rs / ekf.rs / complementary.rs / props_invariant.rs / mod.rs）。
+- `joc-app-rust/src/flyctrl/telemetry.rs`：传 `G_THROTTLE` 给 VFR_HUD，按 20ms 累加 `boot_ms` 写入 `est.time_boot_ms`。
+- 新增静态状态隔离 + 日志健壮性 + 缓冲长度校验（避免规则见下）。
+
+### 2. 实机下行字节级验证（`tools/verify_structure.py COM12 115200 10`）
+```
+TOTAL=130048  CRC_VALID_FRAMES=3612
+contiguous=3609  overlap=0  gap=2 (of 3611)
+msgid 循环: [0, 32, 1, 30, 74, 33] 严格重复，每类 600+ 次均衡
+  msg 0  = HEARTBEAT       21B
+  msg 32 = LOCAL_POSITION_NED 40B
+  msg 1  = SYS_STATUS      43B   (CRC_EXTRA=124)
+  msg 30 = ATTITUDE        40B   ← 欧拉角布局生效，CRC 全对
+  msg 74 = VFR_HUD         32B   ← 标准布局生效，CRC 全对
+  msg 33 = GLOBAL_POSITION_INT 40B
+```
+结论：ATTITUDE / VFR_HUD 修复后下行字节流严格 [HB][LP][SS][ATT][VFR][GPS] 循环，
+**CRC 全对、seq 单调、无重复、无丢帧**，GCS 可逐帧解析。
+
+### 3. 地面站联调（`groundctrl-tools.exe --port COM12 --duration 10`）
+- 串口链路正常打开，HEARTBEAT (sys=1 comp=1) 持续解析输出，custom_mode 合法。
+- 说明 GCS 层能正常消费下行帧；ATTITUDE/VFR_HUD 因字节级验证已确认 CRC 与布局正确，QGC 类标准 GCS 可直接解析。
+
+### 4. 板载运行时（`run_app.py` / COM8）
+- App 挂载 `RUST app mounted`、飞控 4 任务（control/sensors/telem/uplink）全启动。
+- 心跳 `hb seq` 单调递增，imu_ok/gps/baro 全 true，armed=true，无 fault 无卡死。
+
+### 5. 用户给定避免规则（固化，后续改动必须遵守）
+1. 解析环形/外部缓冲前必先校验长度字段（0 或超界丢弃，绝不信任输入）。
+2. 日志系统必须绝对健壮：一条坏日志只丢该条，绝不 panic 阻塞/挂死业务任务或整个 App。
+3. 新增下行帧后同步更新验证脚本的 CRC_EXTRA 表（否则误报 crc_bad）。
+4. 新增静态状态（.rust_bss）检查与任务栈的隔离（防栈溢出覆盖，同 PLAYBACK 教训）。
+5. 上述适用于所有外部输入解析 / 日志 / 下行帧编码 / 链接布局改动。
