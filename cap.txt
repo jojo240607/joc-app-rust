@@ -1,3 +1,0 @@
-[listening COM8 @115200 for 15s] now press board RESET or power-cycle...
-
-[TOTAL=0 HAS_READY=False HAS_APP=False HAS_FC=False HAS_HB=False]
