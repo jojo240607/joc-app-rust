@@ -47,11 +47,13 @@ time.sleep(0.3)
 s.reset_input_buffer()
 buf = bytearray()
 frames = 0; ok = 0; bad = 0; ids = {}
+raw = 0
 t0 = time.time()
-while time.time() - t0 < 5:
+while time.time() - t0 < 15:
     b = s.read(256)
     if b:
         buf += b
+        raw += len(b)
     while True:
         r = try_parse(buf, CRC)
         if r is None:
@@ -70,4 +72,4 @@ while time.time() - t0 < 5:
     if len(buf) > 1024:
         del buf[:len(buf) - 512]
 s.close()
-print(f"frames={frames} crc_ok={ok} crc_bad={bad} ids={ids} leftover={len(buf)}")
+print(f"raw={raw} frames={frames} crc_ok={ok} crc_bad={bad} ids={ids} leftover={len(buf)}")

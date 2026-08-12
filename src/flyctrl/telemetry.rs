@@ -90,31 +90,10 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
         if seq == 1 {
             info!(tag: "telem", "first loop done; armed={}", armed);
         }
-        if seq % 50 == 0 {
-            // 系统健康快照（原为 monitor 任务，现已并入 telem，每 1s 一次）。
-            let (mut imu_ok, mut gps_ok, mut baro_ok, mut sens_armed): (bool, bool, bool, bool);
-            {
-                unsafe {
-                    let mut s1;
-                    loop {
-                        s1 = crate::flyctrl::SENSOR_SEQ;
-                        if s1 & 1 != 0 { continue; }
-                        let f = &*core::ptr::addr_of!(crate::flyctrl::SENSOR_FRAME);
-                        imu_ok = f.imu_ok;
-                        gps_ok = f.gps_ok;
-                        baro_ok = f.baro_ok;
-                        sens_armed = f.armed;
-                        let s2 = crate::flyctrl::SENSOR_SEQ;
-                        if s1 == s2 { break; }
-                    }
-                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                }
-            }
-            info!(tag: "telem",
-                  "hb seq={} usb_wr={} imu/gps/baro={}/{}/{} sens_armed={} crit={} uptime={}ms",
-                  seq, wrote_usb,
-                  imu_ok, gps_ok, baro_ok, sens_armed, health == Health::Critical, crate::rtos_sync::tick_count());
-        }
+        // 注意：周期性 hb 健康日志已移除 —— 它每 1s 走阻塞式 uart0 控制台，曾在
+        // UART DMA TX 上死锁（telem 永久卡在 tx_idle 信号量），导致 usb0 停止下行。
+        // telem 的下行目标本就是 usb0，状态/健康数据已随 MAVLink 帧下行，无需再经
+        // 共享控制台打周期日志。需要诊断时用 GDB 直接读任务状态/EST_MTX。
 
         msleep(20);
     }
