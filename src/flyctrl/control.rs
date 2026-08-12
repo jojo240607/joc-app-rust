@@ -13,12 +13,9 @@ use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, VehicleState};
 
 use crate::abi::RTOS_PRIO_BH_HIGH;
 use crate::device::Device;
-// [BISECT] 暂时隔离 uplink 依赖
-// use crate::flyctrl::uplink::{G_CMD_ARMED, G_CMD_MODE};
 use crate::ioctl;
 use crate::{info, warn};
 use crate::rtos_sync::msleep;
-// [BISECT] 恢复 atomic import（供 set_cmd_* 使用 Ordering）
 use core::sync::atomic::Ordering;
 use crate::sensors::SimImu;
 
@@ -28,8 +25,6 @@ use crate::sensors::SimImu;
 const VERBOSE: bool = false;
 use crate::flyctrl::{make_name, EST_MTX, EST_STATE, SENSOR_FRAME, SENSOR_SEQ};
 
-// [BISECT] 恢复指令接口（仅 store 原子变量，供 uplink 调用），但 control 主循环暂不读取，
-// 用于隔离 spawn 本身 vs uplink_task 内部 usb0 操作。
 /// 上行指令解锁：地面站经 COMMAND_LONG(ARM/DISARM) 设置。
 /// 与控制律内部 RC 解锁做逻辑或（任一为真即解锁）。
 pub fn set_cmd_armed(arm: bool) {
@@ -94,8 +89,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 if s1 == s2 { break; } // 首尾一致，读取完整
             }
         }
-        // [BISECT] 暂时隔离 uplink 指令解锁逻辑，恢复纯 RC 解锁
-        let armed_eff = armed;
+        // 指令解锁：与地面站上行命令做逻辑或（RC 解锁 或 指令解锁 任一为真）。
+        let cmd_armed = crate::flyctrl::uplink::G_CMD_ARMED.load(Ordering::Relaxed);
+        let armed_eff = armed || cmd_armed;
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: sen-mtx got"); }
 
         // IMU 缺失 → 模拟源（总线异常降级）

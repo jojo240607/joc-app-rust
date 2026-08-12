@@ -159,7 +159,9 @@ impl UplinkTx {
     /// 非阻塞轮询一次 usb0.read，喂入增量解析器；每闭合一帧即路由。
     fn poll_read(&mut self, buf: &mut [u8]) {
         let n = self.dev.read(buf);
-        if n > 0 {
+        // 防御：驱动 read 可能返回负数错误码或异常长度；只在 0 < n <= buf.len() 时解析，
+        // 否则跳过（避免切片越界），不阻塞轮询。
+        if n > 0 && (n as usize) <= buf.len() {
             // 解耦：feed 闭包借用 &mut self.parser，故路由用自由函数，
             // 仅捕获 self.dev（共享）与 self.seq（可变）的独立字段引用。
             let dev = &self.dev;
@@ -169,6 +171,8 @@ impl UplinkTx {
                     route_frame(dev, seq, msgid, payload);
                 }
             });
+        } else if n != 0 {
+            info!(tag: "uplink", "poll_read n={} (buf.len={})", n, buf.len());
         }
     }
 }
@@ -212,17 +216,22 @@ fn param_value(dev: &Device, seq: &mut u8, idx: u16) {
 // ── 命令路由 ──────────────────────────────────────────────────────────
 /// 处理一帧已 decode 的 MAVLink 消息（自由函数，避免与 parser 的可变借用冲突）。
 fn route_frame(dev: &Device, seq: &mut u8, msgid: u8, payload: &[u8]) {
-    // [BISECT] 临时空置所有路由动作：只记录收到的 msgid，不调用任何 control 接口、
-    // 不发 ACK/参数，用于区分"usb0.read 轮询+解析" vs "路由动作"导致的卡死。
     match msgid {
         mavlink::msg_id::COMMAND_LONG => {
-            info!(tag: "uplink", "[BISECT] COMMAND_LONG rx (route disabled)");
+            if let Some(cmd) = mavlink::decode_command_long(payload) {
+                handle_command_long(dev, seq, cmd);
+            }
         }
         mavlink::msg_id::PARAM_REQUEST_LIST => {
-            info!(tag: "uplink", "[BISECT] PARAM_REQUEST_LIST rx (route disabled)");
+            // 触发参数流水（下次循环逐条发）
+            G_PARAM_TX_IDX.store(0, Ordering::Relaxed);
+            G_PARAM_REQ.store(true, Ordering::Relaxed);
+            info!(tag: "uplink", "PARAM_REQUEST_LIST rx; start streaming {} params", PARAMS.len());
         }
         mavlink::msg_id::PARAM_SET => {
-            info!(tag: "uplink", "[BISECT] PARAM_SET rx (route disabled)");
+            if let Some(ps) = mavlink::decode_param_set(payload) {
+                handle_param_set(dev, seq, ps);
+            }
         }
         _ => {
             // 其余消息（HEARTBEAT/ATTITUDE 等上行）第一版忽略
@@ -282,12 +291,10 @@ fn handle_param_set(dev: &Device, seq: &mut u8, ps: mavlink::ParamSet) {
 }
 
 // ── uplink 任务入口 ───────────────────────────────────────────────────
-// [VERIFY] 验证版：真正轮询读 usb0（调用 poll_read）。用于验证 usb.c 的
-// OUT 反压自愈修复（read 末尾自动 usbd_cdc_out_reenarm）是否消除"usb0.read
-// 卡死"。验证完回退到 BISECT idle 版或正式实现。
 pub extern "C" fn uplink_task(_arg: *mut c_void) {
-    info!(tag: "uplink", "task started; prio={}", RTOS_PRIO_MAIN);
+    info!(tag: "uplink", "task started; poll usb0.read, prio={}", RTOS_PRIO_MAIN);
 
+    // 复用 boot 已打开的 usb0（见 telemetry 的 Device::get 约定，避免二次 open 重置 USB 状态机）。
     let usb_dev = match Device::get("usb0\0") {
         Some(d) => d,
         None => {
@@ -295,20 +302,42 @@ pub extern "C" fn uplink_task(_arg: *mut c_void) {
             return;
         }
     };
-    info!(tag: "uplink", "usb0 got; poll_read ENABLED (verify usb0.read deadlock fix)");
+
     let mut tx = UplinkTx::new(usb_dev);
-    let mut buf = [0u8; 64];
+    let mut rx_buf = [0u8; 64];
+
     let mut loops: u32 = 0;
-    let mut last: u32 = 0;
     loop {
-        tx.poll_read(&mut buf);
-        loops += 1;
-        // 每 500 循环打印一次存活证据，证明任务没卡死在 read。
-        if loops.wrapping_sub(last) >= 500 {
-            last = loops;
-            info!(tag: "uplink", "alive loop={} (poll_read non-blocking)",
-                  loops);
+        // 非阻塞轮询 usb0.read + 增量解析 + 路由（RX ring 空时返回 0，不阻塞）。
+        tx.poll_read(&mut rx_buf);
+
+        // 参数流水：每次循环最多发一条，避免单次 burst 占满 USB 下行缓冲。
+        if G_PARAM_REQ.load(Ordering::Relaxed) {
+            let idx = G_PARAM_TX_IDX.load(Ordering::Relaxed) as usize;
+            if idx < PARAMS.len() {
+                param_value(&tx.dev, &mut tx.seq, idx as u16);
+                G_PARAM_TX_IDX.store((idx + 1) as u16, Ordering::Relaxed);
+            } else {
+                // 流水完成
+                G_PARAM_REQ.store(false, Ordering::Relaxed);
+                info!(tag: "uplink", "param stream done ({} items)", PARAMS.len());
+            }
         }
-        crate::rtos_sync::msleep(10);
+
+        // 能力请求：发一帧 HEARTBEAT 带 CAPABILITY 标志（第一版简化为 ACK + 置位）。
+        if G_CAP_REQ.load(Ordering::Relaxed) {
+            G_CAP_REQ.store(false, Ordering::Relaxed);
+            // 能力上报复用下行心跳，这里仅记日志；telemetry 会持续发心跳。
+            info!(tag: "uplink", "autopilot capability reported via heartbeat");
+        }
+
+        // 低频存活日志（约每 10s 一次），用于联调确认 uplink 任务未卡死。
+        loops += 1;
+        if loops % 1000 == 0 {
+            info!(tag: "uplink", "poll alive loop={}", loops);
+        }
+
+        // 让出 CPU 10ms（与下行 20ms 错开），保持非阻塞轮询。
+        msleep(10);
     }
 }

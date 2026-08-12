@@ -14,9 +14,8 @@ use crate::abi::RTOS_PRIO_MAIN;
 use crate::device::Device;
 use crate::{info, warn};
 use crate::rtos_sync::msleep;
-// [BISECT] 暂时隔离 uplink 依赖
-// use core::sync::atomic::Ordering;
-// use crate::flyctrl::uplink::G_CMD_MODE;
+use core::sync::atomic::Ordering;
+use crate::flyctrl::uplink::G_CMD_MODE;
 use crate::flyctrl::{EST_MTX, EST_STATE};
 
 /// 帧缓冲放在静态区（不占任务栈）。
@@ -68,8 +67,8 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
         // COM9 但 DTR=False（避免 CH340 复位）时 conn 仍为 0，若据此跳过 usb0 会导致
         // 上位机连着 USB 却收不到 MAVLink。正确做法是无条件写，host 连上即收到。
         let mut wrote_usb = 0i32;
-        // [BISECT] 暂时隔离 uplink 模式反射，custom_mode 固定 0
-        let cmd_mode = 0u8;
+        // 心跳 custom_mode 反映上行指令设置的模式（地面站经 DO_SET_MODE 下发）。
+        let cmd_mode = crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed) as u8;
         let send = |d: &Device, fb: &mut [u8; flyctrl_core::comm::link::MAX_FRAME_LEN],
                     seq: u8, est: &_, armed: bool, health_ok: bool, mode: u8| -> i32 {
             let mut total = 0i32;

@@ -92,21 +92,78 @@ pub extern "C" fn rust_app_start() -> i32 {
 #[cfg(feature = "demo")]
 mod demo {
     use crate::abi::*;
+    use crate::device::Device;
     use crate::info;
-    use crate::rtos_sync::{spawn_rt, RT_NONE};
+    use crate::rtos_sync::{msleep, spawn_rt, RT_NONE};
     use core::ffi::c_void;
 
-    // demo 任务独立栈（放 App RAM，1KB 足够周期日志）。
+    // demo 任务独立栈（放 App RAM，4KB：含 usb0 读写调试路径）。
     #[link_section = ".rust_bss"]
-    static mut DEMO_STACK: [u8; 1024] = [0u8; 1024];
+    static mut DEMO_STACK: [u8; 4096] = [0u8; 4096];
 
     extern "C" fn demo_task_entry(_arg: *mut c_void) {
         let mut n: u32 = 0;
+        // [BISECT] usb0 上下行调试：
+        //  - downlink：每 20ms 写一个 ~28B 大帧（模拟 telem 高频 MAVLink 心跳），
+        //    验证高频大帧是否导致 usb0 TX ring 满（usb_wr 变 0）。
+        //  - uplink：非阻塞读 usb0，收到的字节 echo 回 host（验证 host→板→host 闭环）。
+        let usb = Device::get("usb0\0");
+        info!(tag: "demo", "usb0 handle={}", if usb.is_some() { 1u32 } else { 0u32 });
+        // 模拟一个 MAVLink v2 心跳帧（28B，长度随 seq 低位变化以模拟多消息）。
+        let mut big = [0u8; 32];
+        big[0] = 0xFD;
+        big[1] = 0x09;
+        big[2] = 0x00;
         loop {
             n = n.wrapping_add(1);
-            info!(tag: "demo", "demo task alive seq={} ticks={}", n, crate::rtos_sync::tick_count());
-            crate::rtos_sync::msleep(500);
+            // downlink 大帧（长度字段随 seq 取模，模拟 payload 变化）
+            let paylen = 8 + (n % 9) as u8;
+            big[1] = paylen;
+            let frame_len = (10 + paylen as usize) as i32;
+            let mut wr: i32 = -1;
+            if let Some(d) = &usb {
+                wr = d.write(&big[..frame_len as usize]);
+            }
+            // uplink 读取并 echo
+            let mut rbuf = [0u8; 64];
+            let mut rd: i32 = 0;
+            let mut ech: i32 = 0;
+            if let Some(d) = &usb {
+                let r = d.read(&mut rbuf);
+                if r > 0 {
+                    rd = r;
+                    ech = d.write(&rbuf[..r as usize]);
+                }
+            }
+            if n % 25 == 0 {
+                info!(tag: "demo", "alive seq={} usb_wr={} rd={} echo={}", n, wr, rd, ech);
+            }
+            msleep(20);
         }
+    }
+
+    /// 把 u32 十进制写入 buf，返回写入字节数（无分配）。
+    fn write_u32(buf: &mut [u8], mut v: u32) -> usize {
+        if v == 0 {
+            if !buf.is_empty() { buf[0] = b'0'; }
+            return 1;
+        }
+        let mut tmp = [0u8; 10];
+        let mut i = 0;
+        while v > 0 {
+            tmp[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            i += 1;
+        }
+        let mut n = 0;
+        while i > 0 {
+            i -= 1;
+            if n < buf.len() {
+                buf[n] = tmp[i];
+                n += 1;
+            }
+        }
+        n
     }
 
     pub fn spawn_demo() {

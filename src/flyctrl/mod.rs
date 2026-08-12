@@ -25,7 +25,6 @@
 pub mod control;
 pub mod sensors_task;
 pub mod telemetry;
-// [BISECT] uplink 模块恢复编译，但 uplink_task 内部空转以隔离 usb0 操作
 pub mod uplink;
 
 use flyctrl_core::vehicle::{ImuSample, PosSample, Quaternion, RcInput, VehicleState};
@@ -119,9 +118,8 @@ pub static mut EST_MTX: Mutex = Mutex::uninit();
 
 const STACK_CTRL: usize = 3072; // 控制律含 EKF+PID（当前回放 gps=None，真实 GPS 路径需更多，待数据就绪时再加）
 const STACK_SENS: usize = 3584; // 采样含回放+帧拷贝：实测峰值 > 3072（原靠 monitor 缓冲垫着才不崩），提到 3584 自洽
-const STACK_TELEM: usize = 1024; // 遥测格式化+串口写出，512 会溢出
-// [BISECT] uplink 栈恢复（但 uplink_task 空转）
-const STACK_UPLINK: usize = 1024; // 上行解析+命令路由，与 telem 同量级
+const STACK_TELEM: usize = 4096; // 遥测 encode 3 个 MAVLink 帧(heartbeat/local_pos/sys_status)栈使用大，1024 疑似栈溢出导致 telem 卡住不写 usb0，提到 4096
+const STACK_UPLINK: usize = 4096; // 上行 poll_read+feed+decode 栈使用大，实测 1024 栈溢出导致系统 fault，提到 4096
 
 #[link_section = ".rust_bss"]
 static mut STACK_CTRL_BUF: [u8; STACK_CTRL] = [0u8; STACK_CTRL];
@@ -129,7 +127,6 @@ static mut STACK_CTRL_BUF: [u8; STACK_CTRL] = [0u8; STACK_CTRL];
 static mut STACK_SENS_BUF: [u8; STACK_SENS] = [0u8; STACK_SENS];
 #[link_section = ".rust_bss"]
 static mut STACK_TELEM_BUF: [u8; STACK_TELEM] = [0u8; STACK_TELEM];
-// [BISECT] uplink 栈缓冲恢复
 #[link_section = ".rust_bss"]
 static mut STACK_UPLINK_BUF: [u8; STACK_UPLINK] = [0u8; STACK_UPLINK];
 
@@ -160,6 +157,8 @@ pub fn spawn_flyctrl() {
     unsafe {
         // SENSOR_FRAME 改用 seqlock（见 SENSOR_SEQ），不再需要 SENSOR_MTX。
         EST_MTX.init(RTOS_PRIO_BH_HIGH);    // control(4)/telem(12)
+        crate::info!(tag: "flyctrl", "EST_MTX init count={} (expect 1, 否则互斥未生效→telem 死等)",
+                     EST_MTX.debug_count());
     }
 
     // control：硬实时 prio=4, priv=1, RTOS_RT_HARD
@@ -198,7 +197,7 @@ pub fn spawn_flyctrl() {
         0,
         0,
     );
-    // [BISECT] uplink 任务恢复 spawn，但 uplink_task 内部空转（不碰 usb0）以隔离
+    // uplink：prio=10, priv=1（轮询 usb0.read，低于 sensors 不挤占采样，高于 telemetry 优先处理命令）
     spawn_rt(
         b"uplink\0",
         uplink::uplink_task,
@@ -211,5 +210,5 @@ pub fn spawn_flyctrl() {
         0,
     );
 
-    crate::info!(tag: "flyctrl", "spawned 4 tasks: control/sensors/telem/uplink (uplink TASK-IDLE BISECT)");
+    crate::info!(tag: "flyctrl", "spawned 4 tasks: control/sensors/telem/uplink (monitor merged into telem)");
 }
