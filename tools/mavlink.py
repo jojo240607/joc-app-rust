@@ -21,6 +21,8 @@ CRC_EXTRA = {
     23: 168,  # PARAM_SET
     30: 39,   # ATTITUDE
     32: 185,  # LOCAL_POSITION_NED  (标准 common.xml；旧脚本误用 143)
+    33: 104,  # GLOBAL_POSITION_INT (标准 common.xml)
+    74: 20,   # VFR_HUD             (标准 common.xml)
     76: 152,  # COMMAND_LONG
     77: 143,  # COMMAND_ACK         (标准 common.xml；旧脚本误用 208)
 }

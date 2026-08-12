@@ -15,8 +15,8 @@ use crate::device::Device;
 use crate::{info, warn};
 use crate::rtos_sync::msleep;
 use core::sync::atomic::Ordering;
-use crate::flyctrl::uplink::G_CMD_MODE;
 use crate::flyctrl::{EST_MTX, EST_STATE};
+use crate::flyctrl::uplink::G_THROTTLE;
 
 /// 帧缓冲放在静态区（不占任务栈）。
 /// 遥测任务独占该缓冲，循环内串行复用，无需互斥。
@@ -48,9 +48,10 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
 
     let mut frame_buf = unsafe { &mut FRAME_BUF };
     let mut seq: u8 = 0;
+    let mut boot_ms: u32 = 0; // 下行 time_boot_ms 累加（20ms/周期）
     loop {
         // 读最新估计（短临界区）
-        let (est, health, armed);
+        let (mut est, health, armed);
         {
             let _g = unsafe { EST_MTX.guard() };
             let s = unsafe { &*core::ptr::addr_of!(EST_STATE) };
@@ -58,6 +59,7 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
             health = s.health;
             armed = s.armed;
         }
+        est.time_boot_ms = boot_ms as i32;
 
         // 下行：USB CDC(usb0) 单通道写。
         //
@@ -67,7 +69,7 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
         // COM9 但 DTR=False（避免 CH340 复位）时 conn 仍为 0，若据此跳过 usb0 会导致
         // 上位机连着 USB 却收不到 MAVLink。正确做法是无条件写，host 连上即收到。
         let mut wrote_usb = 0i32;
-        // 心跳 custom_mode 反映上行指令设置的模式（地面站经 DO_SET_MODE 下发）。
+        // 心跳 custom_mode 反映上行指令设置的模式（地面站经 DO_SET_MODE 下发，ArduCopter 标准码）。
         let cmd_mode = crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed) as u8;
         let send = |d: &Device, fb: &mut [u8; flyctrl_core::comm::link::MAX_FRAME_LEN],
                     seq: u8, est: &_, armed: bool, health_ok: bool, mode: u8| -> i32 {
@@ -90,6 +92,19 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
             let n3 = mavlink::encode_sys_status(health_ok, seq, fb);
             let k3 = d.write(&fb[..n3]);
             if k3 > 0 { total += k3; }
+
+            // 地面站(groundctrl/QGC)主盘所需：姿态球(ATTITUDE) / HUD(VFR_HUD) / 位置(GLOBAL_POSITION_INT)。
+            let na = mavlink::encode_attitude(est, seq, fb);
+            let ka = d.write(&fb[..na]);
+            if ka > 0 { total += ka; }
+
+            let nv = mavlink::encode_vfr_hud(est, G_THROTTLE.load(Ordering::Relaxed) as u16, seq, fb);
+            let kv = d.write(&fb[..nv]);
+            if kv > 0 { total += kv; }
+
+            let ng = mavlink::encode_global_position_int(est, seq, fb);
+            let kg = d.write(&fb[..ng]);
+            if kg > 0 { total += kg; }
             total
         };
         if let Some(d) = usb_dev.as_ref() {
@@ -105,6 +120,7 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
         // telem 的下行目标本就是 usb0，状态/健康数据已随 MAVLink 帧下行，无需再经
         // 共享控制台打周期日志。需要诊断时用 GDB 直接读任务状态/EST_MTX。
 
+        boot_ms = boot_ms.wrapping_add(20);
         msleep(20);
     }
 }

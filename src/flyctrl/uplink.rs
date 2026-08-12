@@ -17,7 +17,7 @@ use crate::device::rtos_device::Device;
 use crate::flyctrl::control;
 use crate::rtos_sync::msleep;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use flyctrl_core::comm::link::{Frame, MAX_FRAME_LEN, MAX_FRAME_LEN as ML_MAX};
 use flyctrl_core::comm::mavlink::{self, enums, CommandLong, MAVLINK_MAGIC};
 use crate::abi::RTOS_PRIO_MAIN;
@@ -25,8 +25,11 @@ use crate::abi::RTOS_PRIO_MAIN;
 // ── 全局共享状态（uplink -> control / telemetry） ──────────────────────
 /// 指令解锁位：地面站经 COMMAND_LONG(ARM/DISARM) 置位；control 任务用 `rc_armed || G_CMD_ARMED`。
 pub static G_CMD_ARMED: AtomicBool = AtomicBool::new(false);
-/// 指令模式：地面站经 COMMAND_LONG(DO_SET_MODE) 设置；telemetry 心跳 custom_mode 反映此值。
+/// 指令模式：地面站经 COMMAND_LONG(DO_SET_MODE) 或 TAKEOFF/LAND/RTL 设置；存 ArduCopter 标准 custom_mode。
+/// 映射：STABILIZE=0, ALT_HOLD=2, LOITER=5, RTL=6, LAND=9, GUIDED=4。telemetry 心跳 custom_mode 反映此值。
 pub static G_CMD_MODE: AtomicU16 = AtomicU16::new(0);
+/// 当前油门百分比(0..100)：control 任务每周期写入，telemetry 经 VFR_HUD 下发。
+pub static G_THROTTLE: AtomicU8 = AtomicU8::new(0);
 /// 参数流水游标：PARAM_REQUEST_LIST 触发后，uplink 逐条发 PARAM_VALUE。
 pub static G_PARAM_TX_IDX: AtomicU16 = AtomicU16::new(0);
 /// 参数请求进行中标志（避免与周期性流水冲突）。
@@ -120,21 +123,28 @@ impl FxParser {
     }
 }
 
-// ── 参数表（只读演示参数，固定数组，无堆） ────────────────────────────
+// ── 参数表（可读写，固定数组，无堆） ──────────────────────────────────
 /// 单个参数项：16 字节 NUL 结尾名 + f32 值。
 struct Param {
     name: [u8; 16],
     value: f32,
 }
 
-/// 第一版参数表（演示/校准常量）；后续可扩展为可读写映射。
-const PARAMS: &[Param] = &[
-    Param { name: *b"Thrust\0\0\0\0\0\0\0\0\0\0", value: 0.75 },
-    Param { name: *b"YawP\0\0\0\0\0\0\0\0\0\0\0\0", value: 0.40 },
-    Param { name: *b"RollP\0\0\0\0\0\0\0\0\0\0\0", value: 0.30 },
-    Param { name: *b"PitchP\0\0\0\0\0\0\0\0\0\0", value: 0.30 },
-    Param { name: *b"MaxThrust\0\0\0\0\0\0\0", value: 1.00 },
+/// 参数名表（const，不可变）。
+const PARAM_NAMES: &[[u8; 16]] = &[
+    *b"Thrust\0\0\0\0\0\0\0\0\0\0",
+    *b"YawP\0\0\0\0\0\0\0\0\0\0\0\0",
+    *b"RollP\0\0\0\0\0\0\0\0\0\0\0",
+    *b"PitchP\0\0\0\0\0\0\0\0\0\0",
+    *b"MaxThrust\0\0\0\0\0\0\0",
 ];
+
+/// 参数值表（可读写，地面站 PARAM_SET 写入；初始值与名表对应）。
+#[link_section = ".rust_bss"]
+static mut G_PARAM_VALS: [f32; 5] = [0.75, 0.40, 0.30, 0.30, 1.00];
+
+/// 参数个数。
+const PARAM_COUNT: usize = 5;
 
 /// 把 16 字节参数名转成 &str（截断到首个 NUL），用于日志。
 fn param_name_str(name: &[u8; 16]) -> &str {
@@ -197,15 +207,16 @@ fn ack(dev: &Device, seq: &mut u8, command: u16, result: u8) {
 
 fn param_value(dev: &Device, seq: &mut u8, idx: u16) {
     let idx = idx as usize;
-    if idx >= PARAMS.len() { return; }
-    let p = &PARAMS[idx];
+    if idx >= PARAM_COUNT { return; }
+    let name = PARAM_NAMES[idx];
+    let val = unsafe { G_PARAM_VALS[idx] };
     let s = next_seq(seq);
     let mut out = [0u8; ML_MAX];
     let n = mavlink::encode_param_value(
-        &p.name,
-        p.value,
+        &name,
+        val,
         enums::MAV_PARAM_TYPE_REAL32,
-        PARAMS.len() as u16,
+        PARAM_COUNT as u16,
         idx as u16,
         s,
         &mut out,
@@ -226,7 +237,7 @@ fn route_frame(dev: &Device, seq: &mut u8, msgid: u8, payload: &[u8]) {
             // 触发参数流水（下次循环逐条发）
             G_PARAM_TX_IDX.store(0, Ordering::Relaxed);
             G_PARAM_REQ.store(true, Ordering::Relaxed);
-            info!(tag: "uplink", "PARAM_REQUEST_LIST rx; start streaming {} params", PARAMS.len());
+            info!(tag: "uplink", "PARAM_REQUEST_LIST rx; start streaming {} params", PARAM_COUNT);
         }
         mavlink::msg_id::PARAM_SET => {
             if let Some(ps) = mavlink::decode_param_set(payload) {
@@ -253,12 +264,35 @@ fn handle_command_long(dev: &Device, seq: &mut u8, cmd: CommandLong) {
             info!(tag: "uplink", "ARM_DISARM cmd={} -> armed={}", cmd.command, arm);
         }
         enums::MAV_CMD_DO_SET_MODE => {
-            // param1 = 自定义模式码（与 flightmode::FlightMode 映射）
-            let mode = cmd.params[0] as u16;
+            // 标准 MAVLink：param1 = base_mode（含 CUSTOM_MODE_ENABLED 位 0x80），param2 = custom_mode。
+            let custom = cmd.params[1] as u16; // ArduCopter 自定义模式码（0/2/5/6/9...）
+            G_CMD_MODE.store(custom, Ordering::Relaxed);
+            control::set_cmd_mode(custom);
+            ack(dev, seq, cmd.command, enums::MAV_RESULT_ACCEPTED);
+            info!(tag: "uplink", "DO_SET_MODE -> custom_mode={}", custom);
+        }
+        // 起飞/降落/返航：直接切到对应 ArduCopter 自定义模式，地面站据此显示模式名。
+        enums::MAV_CMD_NAV_TAKEOFF => {
+            // TAKEOFF 在悬停类模式中按 ALT_HOLD（带目标高度）处理。
+            let mode = enums::COPTER_MODE_ALT_HOLD;
             G_CMD_MODE.store(mode, Ordering::Relaxed);
             control::set_cmd_mode(mode);
             ack(dev, seq, cmd.command, enums::MAV_RESULT_ACCEPTED);
-            info!(tag: "uplink", "DO_SET_MODE -> mode={}", mode);
+            info!(tag: "uplink", "TAKEOFF -> mode={}", mode);
+        }
+        enums::MAV_CMD_NAV_LAND => {
+            let mode = enums::COPTER_MODE_LAND;
+            G_CMD_MODE.store(mode, Ordering::Relaxed);
+            control::set_cmd_mode(mode);
+            ack(dev, seq, cmd.command, enums::MAV_RESULT_ACCEPTED);
+            info!(tag: "uplink", "LAND -> mode={}", mode);
+        }
+        enums::MAV_CMD_NAV_RETURN_TO_LAUNCH => {
+            let mode = enums::COPTER_MODE_RTL;
+            G_CMD_MODE.store(mode, Ordering::Relaxed);
+            control::set_cmd_mode(mode);
+            ack(dev, seq, cmd.command, enums::MAV_RESULT_ACCEPTED);
+            info!(tag: "uplink", "RTL -> mode={}", mode);
         }
         enums::MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES => {
             G_CAP_REQ.store(true, Ordering::Relaxed);
@@ -274,19 +308,20 @@ fn handle_command_long(dev: &Device, seq: &mut u8, cmd: CommandLong) {
 }
 
 fn handle_param_set(dev: &Device, seq: &mut u8, ps: mavlink::ParamSet) {
-    // 第一版：参数表只读，PARAM_SET 仅回显已存值（拒绝写入）。
+    // 参数表可读写：找到同名项写入新值并回显（地面站写后确认）。
     let name = param_name_str(&ps.id);
-    // 找到同名项回显，否则拒绝
     let mut found = false;
-    for (i, p) in PARAMS.iter().enumerate() {
-        if p.name == ps.id {
-            param_value(dev, seq, i as u16);
+    for i in 0..PARAM_COUNT {
+        if PARAM_NAMES[i] == ps.id {
+            unsafe { G_PARAM_VALS[i] = ps.value; }
+            param_value(dev, seq, i as u16); // 回显新值（地面站写后确认）
             found = true;
+            info!(tag: "uplink", "PARAM_SET '{}' = {:.4} (written)", name, ps.value);
             break;
         }
     }
     if !found {
-        info!(tag: "uplink", "PARAM_SET '{}' not found -> read-only", name);
+        info!(tag: "uplink", "PARAM_SET '{}' not found -> ignored", name);
     }
 }
 
@@ -314,13 +349,13 @@ pub extern "C" fn uplink_task(_arg: *mut c_void) {
         // 参数流水：每次循环最多发一条，避免单次 burst 占满 USB 下行缓冲。
         if G_PARAM_REQ.load(Ordering::Relaxed) {
             let idx = G_PARAM_TX_IDX.load(Ordering::Relaxed) as usize;
-            if idx < PARAMS.len() {
+            if idx < PARAM_COUNT {
                 param_value(&tx.dev, &mut tx.seq, idx as u16);
                 G_PARAM_TX_IDX.store((idx + 1) as u16, Ordering::Relaxed);
             } else {
                 // 流水完成
                 G_PARAM_REQ.store(false, Ordering::Relaxed);
-                info!(tag: "uplink", "param stream done ({} items)", PARAMS.len());
+                info!(tag: "uplink", "param stream done ({} items)", PARAM_COUNT);
             }
         }
 

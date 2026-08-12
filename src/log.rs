@@ -94,6 +94,12 @@ fn ring_push(level: Level, payload: &[u8]) -> bool {
     if free >= need {
         // 有空间，直接写
         let n = payload.len();
+        // len 字段 = n+1（level+payload 的字节数）。用 u8 存储，n 最大 254 才不溢出：
+        // n=255 时 n+1=256 -> as u8 = 0，会让消费者读到 len=0 并越界 panic。这里
+        // 显式限制，杜绝源头产生非法 len 字段。
+        if n + 1 > u8::MAX as usize {
+            return false;
+        }
         ring[tail] = (n + 1) as u8; // len（不含 len 字节，含 level）
         ring[(tail + 1) % LOG_RING_SIZE] = level.letter();
         for (i, &b) in payload.iter().enumerate() {
@@ -253,6 +259,13 @@ pub extern "C" fn log_task_entry(_arg: *mut c_void) {
             // ring_pop 写入 n=entry_len=first+1 字节（first=len 字段，含 level+payload），
             // 故 payload(去 len 头) = entry[1..e_len]。
             let e_len = entry[0] as usize;
+            // 防御：len 字段非法（0 或超过 entry 缓冲长度 entry.len()=256）时，丢弃该
+            // 坏条目，绝不 panic 挂死 log_task / 整个 App。len=0 时 &entry[1..0] 会
+            // slice_index_fail panic（曾因此导致 App 挂死）。正常 e_len ≤ 181（emit
+            // 用 buf[180]），故 >256 或 ==0 必是 ring 数据异常。
+            if e_len == 0 || e_len > entry.len() {
+                break; // 坏条目，丢弃并退出本批（ring 数据异常，不再继续）
+            }
             let payload = &entry[1..e_len]; // 去掉 len 头，保留 level+payload
 
             // 尝试把这条 payload 拼入 pkt；遇到 `\n` 转 `\r\n`。

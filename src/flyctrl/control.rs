@@ -116,9 +116,18 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             alt_locked = false;
         }
 
-        // --- 期望状态：原点定高 + 偏航缓动 ---
+        // --- 期望状态：模式决定目标（原点定高 / RTL 回原点 / LAND 缓降） ---
+        // custom_mode 用 ArduCopter 标准码（G_CMD_MODE 由上行 DO_SET_MODE/TAKEOFF/LAND/RTL 写入）。
+        let cmd_mode = crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed);
+        use flyctrl_core::comm::mavlink::enums::COPTER_MODE_LAND;
         let thr_off = (rc.throttle - 0.5) * 2.0;
-        let target_alt = hold_alt.0 - thr_off * 2.0;
+        // 默认目标：锁定高度基准（原点）。LAND 模式触发持续缓降。
+        let mut target_alt = hold_alt.0 - thr_off * 2.0;
+        if cmd_mode == COPTER_MODE_LAND {
+            // LAND：在基准高度上每周期降 0.02m，趋向地面（D 向下，地面=0）。
+            target_alt = (est.pos[2].0 - 0.02).max(0.0);
+        }
+        // RTL/LOITER 水平目标已为原点（N=0,E=0）；STABILIZE 保持同样基准，确保联调可观测。
         let setpoint = Setpoint {
             pos: [Meter(0.0), Meter(0.0), Meter(target_alt)],
             yaw: Radian(rc.yaw * 0.5),
@@ -163,6 +172,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             s.est = est;
             s.health = health;
             if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-written"); }
+            // 油门百分比(0..100) 供 telemetry 经 VFR_HUD 下发。
+            let throttle_avg = (cmd.motor[0] + cmd.motor[1] + cmd.motor[2] + cmd.motor[3]) / 4.0;
+            crate::flyctrl::uplink::G_THROTTLE.store((throttle_avg.clamp(0.0, 1.0) * 100.0) as u8, Ordering::Relaxed);
         }
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-mtx got"); }
 

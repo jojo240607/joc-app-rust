@@ -76,6 +76,7 @@ impl EstState {
     const fn empty() -> Self {
         EstState {
             est: VehicleState {
+                time_boot_ms: 0,
                 pos: [Meter(0.0), Meter(0.0), Meter(0.0)],
                 vel: [MeterPerSecond(0.0), MeterPerSecond(0.0), MeterPerSecond(0.0)],
                 att: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 },
