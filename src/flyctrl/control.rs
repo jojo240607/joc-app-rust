@@ -101,7 +101,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         };
 
         // --- 状态估计（EKF；GPS 位置测量可选） ---
-        let est: VehicleState = ekf.step(dt, imu_sample, gps);
+        let est: VehicleState = ekf.step(dt, imu_sample, gps, None);
 
         // --- FDIR 监控（四源可用性；mag 暂用 false，待 I2C 修复后接 sensors 帧） ---
         let mag_ok = false; // TODO: 接 SENSOR_FRAME.mag_ok（待 joc-base I2C 修复）

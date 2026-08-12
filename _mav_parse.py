@@ -10,8 +10,9 @@ def crc16_cont(crc, data):
                 crc >>= 1
     return crc & 0xFFFF
 
-# 标准 MAVLink v2 CRC_EXTRA（与 flyctrl/core/src/comm/mavlink.rs 对齐）
-CRC = {0: 50, 1: 124, 30: 39, 32: 143, 76: 152, 77: 208, 21: 159, 22: 220, 23: 168}
+# 标准 MAVLink v2 CRC_EXTRA（必须与 flyctrl/core/src/comm/mavlink.rs 完全一致：
+# LOCAL_POSITION_NED=185 旧误用 143，COMMAND_ACK=143 旧误用 208）
+CRC = {0: 50, 1: 124, 30: 39, 32: 185, 76: 152, 77: 143, 21: 159, 22: 220, 23: 168}
 
 def try_parse(buf, crc_extra):
     """在 buf 中找第一处合法的 MAVLink v2 帧。

@@ -72,14 +72,24 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
         let send = |d: &Device, fb: &mut [u8; flyctrl_core::comm::link::MAX_FRAME_LEN],
                     seq: u8, est: &_, armed: bool, health_ok: bool, mode: u8| -> i32 {
             let mut total = 0i32;
-            for n in [
-                mavlink::encode_heartbeat(mode, armed, seq, fb),
-                mavlink::encode_local_pos_from(mavlink::SYS_ID, est, seq, fb),
-                mavlink::encode_sys_status(health_ok, seq, fb),
-            ] {
-                let k = d.write(&fb[..n]);
-                if k > 0 { total += k; }
-            }
+            // 逐个 encode 后【立即 write】。不能用 `for n in [enc(), enc(), enc()]`：
+            // Rust 会【急切求值】数组三个元素，而三个 encode_* 都写入同一个共享 fb
+            // 缓冲，数组构建完 fb 只剩最后一个 encode_sys_status 的 SYS_STATUS，
+            // 循环里 write(&fb[..n]) 三次写的都是同一个 SS 帧的切片（21/40/43B 全
+            // 是 SYS_STATUS 头 fd1f0000...）→ host 端只有 SS、无 HB/LP、每 seq 前缀
+            // 重复 3 次、CRC 全错。改为每帧 encode 后立即 write，fb 在 write 前是
+            // 正确的当前帧。
+            let n1 = mavlink::encode_heartbeat(mode, armed, seq, fb);
+            let k1 = d.write(&fb[..n1]);
+            if k1 > 0 { total += k1; }
+
+            let n2 = mavlink::encode_local_pos_from(mavlink::SYS_ID, est, seq, fb);
+            let k2 = d.write(&fb[..n2]);
+            if k2 > 0 { total += k2; }
+
+            let n3 = mavlink::encode_sys_status(health_ok, seq, fb);
+            let k3 = d.write(&fb[..n3]);
+            if k3 > 0 { total += k3; }
             total
         };
         if let Some(d) = usb_dev.as_ref() {

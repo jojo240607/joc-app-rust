@@ -78,6 +78,11 @@ SECTIONS
   {
     . = ALIGN(4);
     _sappbss = .;
+    /* 隔离 gap：.app_bss 的栈缓冲(如 log_task 的 LOG_TASK_STACK)可能向下溢出，
+     * 而 .app_data(PLAYBACK 等)恰好紧邻其下。此处留 0x100 冗余区，即使任务栈
+     * 意外溢出也不至于立刻踩坏紧邻的 .app_data 全局变量（栈是向下增长的）。 */
+    . = . + 0x100;
+    . = ALIGN(4);
     *(.rust_bss)
     *(.rust_bss.*)
     *(.bss)

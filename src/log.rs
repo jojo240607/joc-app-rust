@@ -211,8 +211,16 @@ pub(crate) fn emit(level: Level, tag: &str, args: core::fmt::Arguments) {
  * =========================================================================== */
 
 /// 日志任务栈（放 App RAM）。
+///
+/// 容量必须足够容纳 `log_task_entry` 的栈需求：
+///   - 聚合缓冲 `pkt` (512B) + 单条解码 `tmp` (256B) + 调用 `ring_pop`/`dev.write`
+///     /`msleep` 的栈帧。
+///   早期 1024B 太小 → 任务栈向下溢出，覆盖紧邻其下的 `PLAYBACK` 全局
+///   (sensors 虚拟回放状态机, 在 app.ld 里恰好排布于 .app_bss 之前) →
+///   PLAYBACK.idx 被日志文本 "IR/I" 覆盖成垃圾 → sensors_task 用坏索引访问
+///   DATASET_FRAMES → 确定性 BusFault → "进 App 卡死"。改为 4096 提供充足余量。
 #[link_section = ".rust_bss"]
-static mut LOG_TASK_STACK: [u8; 1024] = [0u8; 1024];
+static mut LOG_TASK_STACK: [u8; 4096] = [0u8; 4096];
 
 /// 日志任务优先级：低于所有业务任务（ctrl=4,sensor=5,uplink=10,telem=12,monitor≈14），
 /// 靠近 idle(31)，即使阻塞在 uart0 也不影响业务。取 28。

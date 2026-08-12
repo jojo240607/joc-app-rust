@@ -80,6 +80,7 @@ impl EstState {
                 vel: [MeterPerSecond(0.0), MeterPerSecond(0.0), MeterPerSecond(0.0)],
                 att: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 },
                 omega: [RadianPerSecond(0.0), RadianPerSecond(0.0), RadianPerSecond(0.0)],
+                airspeed: MeterPerSecond(0.0),
             },
             health: Health::Degraded,
             armed: false,
