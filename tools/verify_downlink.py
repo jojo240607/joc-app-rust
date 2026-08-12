@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""USB CDC 下行(MATLink v2)严格验证：抓 COM 端口原始流，只接受 CRC 校验通过的完整帧，
+"""USB CDC 下行(MAVLink v2)严格验证：抓 COM 端口原始流，只接受 CRC 校验通过的完整帧，
 统计帧数 / 各 msgid 计数 / seq 连续度（seq 重复=字节污染，seq 跳变>1=丢帧）。
 
 要求：板子已运行 + USB 已枚举（不要挂 OpenOCD/gdb，halt 会让 CDC 端口掉线）。
 复用 tools/mavlink.py 的 CRC 与扫描逻辑。
 
+注意（已修复重复计数缺陷）：旧版每读一批就对整个 buf 从头 scan_frames() 再
+del buf[:len-64]，而最小帧(HEARTBEAT 21B)<64B，导致靠近 buf 末尾的完整帧被
+保留并在下一轮【重复计数】→ seq_dups 假阳性。现改为维护解析游标 scan_pos，
+每帧只解析一次；只丢弃已解析的字节，不重复扫。若仍报 seq_dups，才是真字节重复。
+
 用法：
   python tools/verify_downlink.py [PORT] [SECS]
-  python tools/verify_downlink.py COM12 15
-端口缺省自动探测 ST VCP (VID_0483/PID_5740)。
 """
 import argparse
 import sys
@@ -35,6 +38,7 @@ def main():
     s.reset_input_buffer()
 
     buf = bytearray()
+    scan_pos = 0               # 已解析到的字节偏移（单调，不回头）
     raw = frames = ok = bad = 0
     ids = {}
     seq_last = {}
@@ -45,23 +49,46 @@ def main():
         if b:
             buf += b
             raw += len(b)
-        for d in ml.scan_frames(buf):
+        # 只在 buf[scan_pos:] 里滑动解析，每个 0xFD 尝试一帧；成功则前移 scan_pos。
+        i = scan_pos
+        n = len(buf)
+        while i < n - 11:
+            if buf[i] != ml.MAGIC:
+                i += 1
+                continue
+            plen = buf[i + 1]
+            if plen > 255:
+                i += 1
+                continue
+            total = 10 + plen + 2
+            if i + total > n:
+                break                       # 帧未收齐，等更多数据
+            msgid = buf[i + 7] | (buf[i + 8] << 8) | (buf[i + 9] << 16)
+            seq = buf[i + 4]
+            c = ml.crc16(0xFFFF, buf[i + 1:i + 10 + plen])
+            c = ml.crc16(c, [ml.CRC_EXTRA.get(msgid, 0)])
+            fc = buf[i + total - 2] | (buf[i + total - 1] << 8)
+            crc_ok = (c == fc)
             frames += 1
-            if d.crc_ok:
+            if crc_ok:
                 ok += 1
             else:
                 bad += 1
-            ids[d.msgid] = ids.get(d.msgid, 0) + 1
-            if d.msgid in seq_last:
-                delta = (d.seq - seq_last[d.msgid]) & 0xFF
+            ids[msgid] = ids.get(msgid, 0) + 1
+            if crc_ok and msgid in seq_last:
+                delta = (seq - seq_last[msgid]) & 0xFF
                 if delta == 0:
                     seq_dups += 1
                 elif delta != 1:
                     seq_jumps += 1
-            seq_last[d.msgid] = d.seq
-        # scan_frames 已逐整帧跳过；丢弃已处理部分，仅保留可能残缺的尾帧(<=64B)
-        if len(buf) > 64:
-            del buf[:len(buf) - 64]
+            if crc_ok:
+                seq_last[msgid] = seq
+            scan_pos = i + total            # 前进到本帧末尾，避免重复计数
+            i += total
+        # 丢弃已解析的字节，只保留未解析/可能残缺的尾部
+        if scan_pos > 0:
+            del buf[:scan_pos]
+            scan_pos = 0
     s.close()
 
     print(f"raw={raw} frames={frames} crc_ok={ok} crc_bad={bad} "
