@@ -161,6 +161,10 @@ pub fn spawn_flyctrl() {
                      EST_MTX.debug_count());
     }
 
+    // 日志消费者任务（低优先，drain 日志 ring → uart0）。必须最先创建，确保后续
+    // 业务任务的 info! 日志能及时被输出（只写 ring，绝不阻塞业务任务）。
+    crate::log::spawn_log_task();
+
     // control：硬实时 prio=4, priv=1, RTOS_RT_HARD
     spawn_rt(
         b"control\0",
