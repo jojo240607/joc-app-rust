@@ -198,7 +198,8 @@ pub(crate) fn emit(level: Level, tag: &str, args: core::fmt::Arguments) {
     let _ = core::fmt::write(&mut w, args);
     len += w.pos();
 
-    buf[len] = b'\r'; len += 1;
+    // 换行语义归一：ring 内只存 `\n`，由消费者(log_task)拼包时统一转 `\r\n`。
+    // 这样多条日志可在消费者侧拼成单帧 uart0 发送，避免每条单独 write 被调度拆散。
     buf[len] = b'\n'; len += 1;
 
     ring_push(level, &buf[..len]);
@@ -220,28 +221,97 @@ const LOG_TASK_PRIO: u8 = 28;
 pub extern "C" fn log_task_entry(_arg: *mut c_void) {
     // uart0 复用 C 侧已打开的句柄；只 get + write，绝不 open/close。
     let uart = Device::get("uart0\0");
-    let mut buf = [0u8; 128];
+    // 聚合缓冲：一次唤醒内积攒的多条日志拼成一个连续帧，末尾一次性 dev_write。
+    // 这样多条日志不会被调度拆成多次 write，规避与 C 侧 printf 在行中间交错。
+    let mut pkt = [0u8; 512];
+    let mut pkt_len = 0usize;
     loop {
-        // drain：把 ring 里积压的条目尽可能读出并一次写 uart0（非阻塞互斥）。
-        // 可能输出多条，直到 ring 空。单条最长 128B（覆盖 1+1+~120 payload）。
+        let mut flushed = false;
         while let Some(dev) = uart.as_ref() {
-            let n = {
-                // 与生产者互斥地取走一条
+            // 互斥地取走一条 `[len][level][payload]`（payload 末尾为 `\n`）。
+            let entry = {
                 if !try_lock() {
                     break;
                 }
-                let got = ring_pop(&mut buf);
+                let mut tmp = [0u8; 256];
+                let got = ring_pop(&mut tmp);
                 unlock();
-                got
+                if got == 0 {
+                    break; // ring 空
+                }
+                tmp
             };
-            if n == 0 {
-                break; // ring 空
+            // entry[0]=len, entry[1]=level, entry[2..]= "R/L ticks tag: msg\n"
+            // ring_pop 写入 n=entry_len=first+1 字节（first=len 字段，含 level+payload），
+            // 故 payload(去 len 头) = entry[1..e_len]。
+            let e_len = entry[0] as usize;
+            let payload = &entry[1..e_len]; // 去掉 len 头，保留 level+payload
+
+            // 尝试把这条 payload 拼入 pkt；遇到 `\n` 转 `\r\n`。
+            let mut i = 0usize;
+            while i < payload.len() {
+                if payload[i] == b'\n' {
+                    if pkt_len + 2 > pkt.len() {
+                        break; // pkt 满，先 flush 再继续
+                    }
+                    pkt[pkt_len] = b'\r';
+                    pkt[pkt_len + 1] = b'\n';
+                    pkt_len += 2;
+                } else {
+                    if pkt_len + 1 > pkt.len() {
+                        break;
+                    }
+                    pkt[pkt_len] = payload[i];
+                    pkt_len += 1;
+                }
+                i += 1;
             }
-            // 把 `[len][level][payload]` 的 level+payload 交给 uart0（去掉 len 头，
-            // 保留我们拼好的 "R/L ticks tag: msg\r\n" 完整行）。
-            let _ = dev.write(&buf[1..n]);
+            // 若这条没拼完（pkt 满），flush 当前 pkt，余下部分下轮继续。
+            if i < payload.len() {
+                let _ = dev.write(&pkt[..pkt_len]);
+                pkt_len = 0;
+                flushed = true;
+                // 把剩余 payload 直接 copy 进空 pkt（仍是 \n→\r\n 转换）
+                while i < payload.len() {
+                    if payload[i] == b'\n' {
+                        if pkt_len + 2 > pkt.len() {
+                            break;
+                        }
+                        pkt[pkt_len] = b'\r';
+                        pkt[pkt_len + 1] = b'\n';
+                        pkt_len += 2;
+                    } else {
+                        if pkt_len + 1 > pkt.len() {
+                            break;
+                        }
+                        pkt[pkt_len] = payload[i];
+                        pkt_len += 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+
+            // pkt 即将溢出 → 先 flush 再继续拼。
+            if pkt_len + payload.len() + 2 > pkt.len() {
+                let _ = dev.write(&pkt[..pkt_len]);
+                pkt_len = 0;
+                flushed = true;
+            }
         }
-        msleep(5);
+        // ring 空了：把 pkt 剩余一次性发出（即使不满，也保证不丢日志）。
+        if pkt_len > 0 {
+            if let Some(dev) = uart.as_ref() {
+                let _ = dev.write(&pkt[..pkt_len]);
+            }
+            pkt_len = 0;
+            flushed = true;
+        }
+        if !flushed {
+            // 本轮什么都没发（ring 空且 pkt 空）→ 正常节流睡眠。
+            msleep(5);
+        }
+        // 若发了数据，立即再扫一轮 ring（不睡眠），把突发日志尽快清空。
     }
 }
 
