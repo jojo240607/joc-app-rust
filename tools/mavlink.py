@@ -19,6 +19,8 @@ CRC_EXTRA = {
     21: 159,  # PARAM_REQUEST_LIST
     22: 220,  # PARAM_VALUE
     23: 168,  # PARAM_SET
+    20: 214,  # PARAM_REQUEST_READ   (与 flyctrl-core mavlink.rs 一致)
+    300: 178, # AUTOPILOT_VERSION     (与 flyctrl-core mavlink.rs 一致)
     30: 39,   # ATTITUDE
     32: 185,  # LOCAL_POSITION_NED  (标准 common.xml；旧脚本误用 143)
     33: 104,  # GLOBAL_POSITION_INT (标准 common.xml)
@@ -33,6 +35,9 @@ SYS_ID = 1
 COMP_ID = 1
 TGT_SYS = 1
 TGT_COMP = 1
+
+# MAV_PARAM_TYPE（PARAM_SET/VALUE 的 param_type 字段）
+MAV_PARAM_TYPE_REAL32 = 9
 
 
 def crc16(crc, data):

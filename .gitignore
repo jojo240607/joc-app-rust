@@ -4,6 +4,8 @@ __pycache__/
 # 调试/烧录脚本的运行时临时产物（临时 cfg / gdb 脚本 / openocd 日志 / 串口捕获）
 _ocd_*.cfg
 _*.gdb
+_*.py
+_*.log
 _*.txt
 _*.err
 ocd_*.log

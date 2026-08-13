@@ -70,6 +70,8 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     let mut first = true;
     loop {
         let dt = Second(4.0 / 1000.0);
+        // 应用地面站参数（每周期原子读 G_PARAM_VALS -> pid 增益；PARAM_SET 即时生效）。
+        crate::flyctrl::uplink::sync_gains_to_pid(&mut pid);
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: loop enter"); }
 
         // --- 取最新传感器帧（seqlock：control 优先级高于 sensors，读不被打断） ---

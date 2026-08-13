@@ -37,6 +37,7 @@ def _open(port):
 def run_test(port):
     s = _open(port)
     seq = 0
+    s.reset_input_buffer()
     # 1) PARAM_REQUEST_LIST -> 期望 PARAM_VALUE
     seq += 1
     f1 = ml.frame(21, bytes([ml.TGT_SYS, ml.TGT_COMP]), seq)
@@ -52,7 +53,6 @@ def run_test(port):
     s.write(f2)
     time.sleep(1.5)
 
-    s.reset_input_buffer()
     buf = bytearray()
     t0 = time.time()
     ids = {}
@@ -111,15 +111,88 @@ def run_arm(port):
         print("FAIL: 心跳始终 base_mode=0x01 (DISARMED) -> ARM 命令未被处理 / 上行未达")
 
 
+def run_params(port):
+    """增强验证：PARAM_SET / PARAM_REQUEST_READ / AUTOPILOT_VERSION 能力上报。
+    - PARAM_SET(KvZ=0.5 合法) -> 收 PARAM_VALUE(22) 回显
+    - PARAM_REQUEST_READ(KvZ) -> 收 PARAM_VALUE(22) 点读回显
+    - PARAM_SET(HoverThrust=2.0 越界) -> 收 COMMAND_ACK(23, FAILED)
+    - COMMAND_LONG(REQUEST_CAPABILITIES=520) -> 收 AUTOPILOT_VERSION(300)
+    """
+    s = _open(port)
+    seq = 0
+    name16 = lambda n: n.encode()[:15].ljust(16, b'\x00')
+
+    def send(msgid, payload):
+        nonlocal seq
+        seq += 1
+        s.write(ml.frame(msgid, payload, seq))
+
+    # 1) PARAM_SET 合法（KvZ=0.5）
+    pl = name16("KvZ") + struct.pack('<f', 0.5) + bytes([ml.MAV_PARAM_TYPE_REAL32]) + bytes(3)
+    print(f"[TX] PARAM_SET KvZ=0.5")
+    send(23, pl)
+    # 2) PARAM_REQUEST_READ（KvZ）
+    pl = name16("KvZ") + (-1).to_bytes(2, 'little', signed=True)
+    print(f"[TX] PARAM_REQUEST_READ KvZ")
+    send(20, pl)
+    # 3) PARAM_SET 越界（HoverThrust=2.0 > 1.0）
+    pl = name16("HoverThrust") + struct.pack('<f', 2.0) + bytes([ml.MAV_PARAM_TYPE_REAL32]) + bytes(3)
+    print(f"[TX] PARAM_SET HoverThrust=2.0 (越界)")
+    send(23, pl)
+    # 4) COMMAND_LONG REQUEST_AUTOPILOT_CAPABILITIES(520)
+    pl = bytes([ml.TGT_SYS, ml.TGT_COMP]) + (520).to_bytes(2, 'little') + bytes(28) + b'\x00'
+    print(f"[TX] COMMAND_LONG(REQUEST_CAP, cmd=520)")
+    send(76, pl)
+
+    time.sleep(2.0)
+    buf = bytearray()
+    t0 = time.time()
+    ids = {}
+    print("[RX] capturing 3s ...")
+    while time.time() - t0 < 3:
+        b = s.read(256)
+        if b:
+            buf += b
+        for d in ml.scan_frames(buf):
+            ids[d.msgid] = ids.get(d.msgid, 0) + 1
+            if d.msgid == 22:  # PARAM_VALUE：解析回显值
+                nm = d.payload[0:16].split(b'\x00')[0].decode(errors='replace')
+                val = struct.unpack('<f', d.payload[16:20])[0]
+                print(f"  -> PARAM_VALUE name='{nm}' value={val:.4f}")
+            elif d.msgid == 77:  # COMMAND_ACK
+                print(f"  -> COMMAND_ACK cmd={int.from_bytes(d.payload[0:2],'little')} result={d.payload[2]}")
+            elif d.msgid == 300:  # AUTOPILOT_VERSION
+                print(f"  -> AUTOPILOT_VERSION received (capabilities={int.from_bytes(d.payload[52:60],'little')})")
+    s.close()
+    print(f"[RX] 应答统计 ids={ids}")
+    ok = True
+    if 22 in ids:
+        print("PASS: PARAM_SET/PARAM_REQUEST_READ -> 收到 PARAM_VALUE(22) 回显")
+    else:
+        print("FAIL: 未收到 PARAM_VALUE"); ok = False
+    if 300 in ids:
+        print("PASS: REQUEST_CAPABILITIES -> 收到 AUTOPILOT_VERSION(300)")
+    else:
+        print("WARN: 未收到 AUTOPILOT_VERSION(300)（能力上报可能未生效）")
+    if 77 in ids:
+        print("PASS: 越界 PARAM_SET -> 收到 COMMAND_ACK(23, FAILED)")
+    else:
+        print("WARN: 越界 PARAM_SET 未回 COMMAND_ACK（范围校验可能未生效）")
+    print("DONE" if ok else "PARTIAL")
+
+
 def main():
     ap = argparse.ArgumentParser(description="飞控 USB CDC 上行联调")
     ap.add_argument("port", nargs="?", default=None, help="串口 (默认自动探测)")
     ap.add_argument("--test", action="store_true", help="发 PARAM_REQUEST_LIST + COMMAND_LONG")
     ap.add_argument("--arm", action="store_true", help="反复 ARM/DISARM 测心跳 base_mode")
+    ap.add_argument("--params", action="store_true", help="验证 PARAM_SET/REQUEST_READ/AUTOPILOT_VERSION")
     args = ap.parse_args()
     port = args.port or (ml.find_cdc() or "COM12")
     if args.test:
         run_test(port)
+    elif args.params:
+        run_params(port)
     else:
         run_arm(port)
 

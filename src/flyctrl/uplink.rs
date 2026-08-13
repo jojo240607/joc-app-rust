@@ -124,24 +124,25 @@ impl FxParser {
 }
 
 // ── 参数表（可读写，固定数组，无堆） ──────────────────────────────────
-/// 单个参数项：16 字节 NUL 结尾名 + f32 值。
-struct Param {
-    name: [u8; 16],
-    value: f32,
-}
-
-/// 参数名表（const，不可变）。
+/// 参数名表（const，不可变）。名字映射到 PidController 的真实增益字段。
+/// 顺序必须与 `G_PARAM_VALS` / `pid_gain_apply` 的索引约定一致（见 control.rs）。
 const PARAM_NAMES: &[[u8; 16]] = &[
-    *b"Thrust\0\0\0\0\0\0\0\0\0\0",
-    *b"YawP\0\0\0\0\0\0\0\0\0\0\0\0",
-    *b"RollP\0\0\0\0\0\0\0\0\0\0\0",
-    *b"PitchP\0\0\0\0\0\0\0\0\0\0",
-    *b"MaxThrust\0\0\0\0\0\0\0",
+    *b"KpXY\0\0\0\0\0\0\0\0\0\0\0\0",
+    *b"KpZ\0\0\0\0\0\0\0\0\0\0\0\0\0",
+    *b"KvXY\0\0\0\0\0\0\0\0\0\0\0\0",
+    *b"KvZ\0\0\0\0\0\0\0\0\0\0\0\0\0",
+    *b"HoverThrust\0\0\0\0\0",
 ];
 
-/// 参数值表（可读写，地面站 PARAM_SET 写入；初始值与名表对应）。
+/// 每个参数的合法取值范围（含端点），用于 PARAM_SET 写前校验。
+/// 越界写入直接拒绝（回 MAV_RESULT_FAILED），绝不写入非法增益导致控制律发散。
+const PARAM_MIN: [f32; 5] = [0.0, 0.0, 0.0, 0.0, 0.1];
+const PARAM_MAX: [f32; 5] = [5.0, 5.0, 5.0, 5.0, 1.0];
+
+/// 参数值表（可读写，地面站 PARAM_SET 写入；初始值与 `PidController::default_quad` 对齐）。
+/// control 任务每周期原子读此表并应用到 pid 增益，使参数设置真正生效。
 #[link_section = ".rust_bss"]
-static mut G_PARAM_VALS: [f32; 5] = [0.75, 0.40, 0.30, 0.30, 1.00];
+static mut G_PARAM_VALS: [f32; 5] = [0.5, 0.5, 0.8, 0.8, 0.5];
 
 /// 参数个数。
 const PARAM_COUNT: usize = 5;
@@ -172,13 +173,23 @@ impl UplinkTx {
         // 防御：驱动 read 可能返回负数错误码或异常长度；只在 0 < n <= buf.len() 时解析，
         // 否则跳过（避免切片越界），不阻塞轮询。
         if n > 0 && (n as usize) <= buf.len() {
+            // 诊断：确认板子确实收到 OUT 字节（临时日志，验证后删除）
+            info!(tag: "uplink", "RX raw n={} first16={:02X?}",
+                  n, &buf[..core::cmp::min(n as usize, 16)]);
             // 解耦：feed 闭包借用 &mut self.parser，故路由用自由函数，
             // 仅捕获 self.dev（共享）与 self.seq（可变）的独立字段引用。
             let dev = &self.dev;
             let seq = &mut self.seq;
             self.parser.feed(&buf[..n as usize], |f: &Frame| {
-                if let Some((msgid, payload)) = mavlink::decode(f) {
-                    route_frame(dev, seq, msgid, payload);
+                match mavlink::decode(f) {
+                    Some((msgid, payload)) => {
+                        info!(tag: "uplink", "frame decoded msgid={} plen={}", msgid, f.len);
+                        route_frame(dev, seq, msgid, payload);
+                    }
+                    None => {
+                        info!(tag: "uplink", "frame decode FAILED magic={:02X} len={}",
+                              f.data[0], f.len);
+                    }
                 }
             });
         } else if n != 0 {
@@ -189,7 +200,9 @@ impl UplinkTx {
 
 /// 非阻塞写出一帧；host 不连/无 IN-token 时 usb write 返回 0（丢帧），不阻塞。
 fn send_frame(dev: &Device, out: &[u8; ML_MAX], n: usize) -> i32 {
-    dev.write(&out[..n])
+    let r = dev.write(&out[..n]);
+    info!(tag: "uplink", "send_frame n={} ret={}", n, r);
+    r
 }
 
 fn next_seq(seq: &mut u8) -> u8 {
@@ -226,7 +239,7 @@ fn param_value(dev: &Device, seq: &mut u8, idx: u16) {
 
 // ── 命令路由 ──────────────────────────────────────────────────────────
 /// 处理一帧已 decode 的 MAVLink 消息（自由函数，避免与 parser 的可变借用冲突）。
-fn route_frame(dev: &Device, seq: &mut u8, msgid: u8, payload: &[u8]) {
+fn route_frame(dev: &Device, seq: &mut u8, msgid: u32, payload: &[u8]) {
     match msgid {
         mavlink::msg_id::COMMAND_LONG => {
             if let Some(cmd) = mavlink::decode_command_long(payload) {
@@ -242,6 +255,18 @@ fn route_frame(dev: &Device, seq: &mut u8, msgid: u8, payload: &[u8]) {
         mavlink::msg_id::PARAM_SET => {
             if let Some(ps) = mavlink::decode_param_set(payload) {
                 handle_param_set(dev, seq, ps);
+            }
+        }
+        mavlink::msg_id::PARAM_REQUEST_READ => {
+            // 按参数名点读单个参数（地面站参数表单点刷新）。
+            if let Some((id, _idx)) = mavlink::decode_param_request_read(payload) {
+                let name = param_name_str(&id);
+                if let Some(i) = find_param(&id) {
+                    param_value(dev, seq, i as u16);
+                    info!(tag: "uplink", "PARAM_REQUEST_READ '{}' -> idx={}", name, i);
+                } else {
+                    info!(tag: "uplink", "PARAM_REQUEST_READ '{}' not found", name);
+                }
             }
         }
         _ => {
@@ -307,22 +332,52 @@ fn handle_command_long(dev: &Device, seq: &mut u8, cmd: CommandLong) {
     }
 }
 
-fn handle_param_set(dev: &Device, seq: &mut u8, ps: mavlink::ParamSet) {
-    // 参数表可读写：找到同名项写入新值并回显（地面站写后确认）。
-    let name = param_name_str(&ps.id);
-    let mut found = false;
+/// 按 16 字节名查找参数索引；找不到返回 None。
+fn find_param(id: &[u8; 16]) -> Option<usize> {
     for i in 0..PARAM_COUNT {
-        if PARAM_NAMES[i] == ps.id {
-            unsafe { G_PARAM_VALS[i] = ps.value; }
-            param_value(dev, seq, i as u16); // 回显新值（地面站写后确认）
-            found = true;
-            info!(tag: "uplink", "PARAM_SET '{}' = {:.4} (written)", name, ps.value);
-            break;
+        if PARAM_NAMES[i] == *id {
+            return Some(i);
         }
     }
-    if !found {
-        info!(tag: "uplink", "PARAM_SET '{}' not found -> ignored", name);
+    None
+}
+
+fn handle_param_set(dev: &Device, seq: &mut u8, ps: mavlink::ParamSet) {
+    // 参数表可读写：找到同名项 -> 范围校验 -> 写入并回显（带 MAV_RESULT）。
+    let name = param_name_str(&ps.id);
+    match find_param(&ps.id) {
+        Some(i) => {
+            // 写前范围校验：越界直接拒绝，绝不写入非法增益。
+            let v = ps.value;
+            if v < PARAM_MIN[i] || v > PARAM_MAX[i] {
+                // 越界：回 COMMAND_ACK(FAILED)，command 填 PARAM_SET(msg_id=23) 作约定。
+                ack(dev, seq, mavlink::msg_id::PARAM_SET as u16, enums::MAV_RESULT_FAILED);
+                info!(tag: "uplink", "PARAM_SET '{}' = {:.4} OUT OF RANGE [{:.2},{:.2}] -> REJECT",
+                      name, v, PARAM_MIN[i], PARAM_MAX[i]);
+                return;
+            }
+            unsafe { G_PARAM_VALS[i] = v; }
+            // 标准做法：仅回显新值（PARAM_VALUE），地面站据此确认写入成功。
+            // 越界分支才回 COMMAND_ACK(FAILED)，合法分支靠回显帧确认。
+            param_value(dev, seq, i as u16);
+            info!(tag: "uplink", "PARAM_SET '{}' = {:.4} (written, applied next ctrl tick)", name, v);
+        }
+        None => {
+            info!(tag: "uplink", "PARAM_SET '{}' not found -> ignored", name);
+        }
     }
+}
+
+// ── 参数 -> 控制律桥接（control 任务每周期调用，零锁、原子读） ──────────
+/// 把地面站参数表 `G_PARAM_VALS` 应用到给定 PID 控制器。
+/// control 任务每周期调用一次，使 PARAM_SET 在下一控制拍立即生效。
+/// 读取用 Relaxed 原子序（uplink 单写、control 单读，无需 Acquire/Release 同步语义）。
+pub fn sync_gains_to_pid(pid: &mut flyctrl_core::controller::PidController) {
+    let mut g = [0f32; 5];
+    for i in 0..PARAM_COUNT {
+        g[i] = unsafe { G_PARAM_VALS[i] };
+    }
+    pid.apply_gains(&g);
 }
 
 // ── uplink 任务入口 ───────────────────────────────────────────────────
@@ -359,11 +414,16 @@ pub extern "C" fn uplink_task(_arg: *mut c_void) {
             }
         }
 
-        // 能力请求：发一帧 HEARTBEAT 带 CAPABILITY 标志（第一版简化为 ACK + 置位）。
+        // 能力请求：真发 AUTOPILOT_VERSION 帧（响应 REQUEST_AUTOPILOT_CAPABILITIES）。
         if G_CAP_REQ.load(Ordering::Relaxed) {
             G_CAP_REQ.store(false, Ordering::Relaxed);
-            // 能力上报复用下行心跳，这里仅记日志；telemetry 会持续发心跳。
-            info!(tag: "uplink", "autopilot capability reported via heartbeat");
+            let caps = enums::MAV_PROTOCOL_CAPABILITY_MAVLINK2
+                | enums::MAV_PROTOCOL_CAPABILITY_PARAM_FLOAT;
+            let s = next_seq(&mut tx.seq);
+            let mut out = [0u8; ML_MAX];
+            let n = mavlink::encode_autopilot_version(caps, s, &mut out);
+            let _ = send_frame(&tx.dev, &out, n);
+            info!(tag: "uplink", "AUTOPILOT_VERSION sent (cap=MAVLINK2|PARAM_FLOAT)");
         }
 
         // 低频存活日志（约每 10s 一次），用于联调确认 uplink 任务未卡死。
