@@ -155,6 +155,10 @@ pub fn spawn_flyctrl() {
     // 运行时填充 EST_STATE（其 static 被强制进 .bss，初始化器已丢弃，必须此处填充）。
     unsafe { (*core::ptr::addr_of_mut!(EST_STATE)) = EstState::empty(); }
 
+    // 运行时填充 G_PARAM_VALS（同 .rust_bss 初值被清零，必须用默认增益显式初始化，
+    // 否则 PARAM_REQUEST_LIST 下发的参数值全 0）。
+    uplink::init_param_defaults();
+
     // 初始化互斥量（天花板优先级取可能锁定者的最高 prio）
     unsafe {
         // SENSOR_FRAME 改用 seqlock（见 SENSOR_SEQ），不再需要 SENSOR_MTX。

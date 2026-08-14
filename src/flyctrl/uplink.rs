@@ -141,8 +141,21 @@ const PARAM_MAX: [f32; 5] = [5.0, 5.0, 5.0, 5.0, 1.0];
 
 /// 参数值表（可读写，地面站 PARAM_SET 写入；初始值与 `PidController::default_quad` 对齐）。
 /// control 任务每周期原子读此表并应用到 pid 增益，使参数设置真正生效。
+///
+/// 注意：此表被强制进 `.rust_bss`（见 link_section），而系统区加载器只清零 APP_RAM、
+/// 不拷贝 `.app_data` 初值——Rust 运行时也不会为 `.bss` 重填非零初值。因此源码里的
+/// `[0.5,0.5,0.8,0.8,0.5]` 初值会被丢弃、运行期全 0。必须在 `init_param_defaults()`
+/// 里显式写入（与 mod.rs 里 EST_STATE 的运行时填充同款手法）。
 #[link_section = ".rust_bss"]
 static mut G_PARAM_VALS: [f32; 5] = [0.5, 0.5, 0.8, 0.8, 0.5];
+
+/// 运行时填充 G_PARAM_VALS 初始值（`.rust_bss` 初值被加载器清零，必须显式写）。
+/// 由 spawn_flyctrl 在任务创建前调用一次。
+pub fn init_param_defaults() {
+    unsafe {
+        *core::ptr::addr_of_mut!(G_PARAM_VALS) = [0.5, 0.5, 0.8, 0.8, 0.5];
+    }
+}
 
 /// 参数个数。
 const PARAM_COUNT: usize = 5;

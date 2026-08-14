@@ -61,20 +61,33 @@ def run_test(port):
         b = s.read(256)
         if b:
             buf += b
-        for d in ml.scan_frames(buf):
+        # 单趟扫描当前 buf（scan_frames 内部跳整帧、不回头）。记录最后一个完整帧末尾，
+        # 只保留其后未解析/不完整的尾部，丢弃已计数的字节 -> 修复重复计数。
+        parsed_end = 0
+        for d in ml.scan_frames(buf, 0):
             ids[d.msgid] = ids.get(d.msgid, 0) + 1
-            if d.msgid in (22, 77):
-                print(f"  -> ACK/RESP msgid={d.msgid} crc_ok")
+            if d.msgid == 22:  # PARAM_VALUE：打印回显值
+                nm = d.payload[0:16].split(b'\x00')[0].decode(errors='replace')
+                val = struct.unpack('<f', d.payload[16:20])[0]
+                print(f"  -> PARAM_VALUE name='{nm}' value={val:.4f}")
+            elif d.msgid == 300:  # AUTOPILOT_VERSION：REQUEST_CAP 的应答（非 COMMAND_ACK）
+                print(f"  -> AUTOPILOT_VERSION received (capabilities={int.from_bytes(d.payload[52:60],'little')})")
+            end = d.off + d.total
+            if end > parsed_end:
+                parsed_end = end
+        if parsed_end > 0:
+            del buf[:parsed_end]
     s.close()
     print(f"[RX] 应答统计 ids={ids}")
-    if 22 in ids:
-        print("PASS: PARAM_REQUEST_LIST -> 收到 PARAM_VALUE(22)")
+    if ids.get(22, 0) > 0:
+        print(f"PASS: PARAM_REQUEST_LIST -> 收到 PARAM_VALUE(22) x{ids[22]}")
     else:
         print("FAIL: 未收到 PARAM_VALUE")
-    if 77 in ids:
-        print("PASS: COMMAND_LONG -> 收到 COMMAND_ACK(77)")
+    # COMMAND_LONG(REQUEST_CAP=520) 的应答是 AUTOPILOT_VERSION(300)，不是 COMMAND_ACK。
+    if ids.get(300, 0) > 0:
+        print(f"PASS: COMMAND_LONG(REQUEST_CAP) -> 收到 AUTOPILOT_VERSION(300) x{ids[300]}")
     else:
-        print("FAIL: 未收到 COMMAND_ACK")
+        print("FAIL: 未收到 AUTOPILOT_VERSION(300)")
 
 
 def run_arm(port):
@@ -153,7 +166,8 @@ def run_params(port):
         b = s.read(256)
         if b:
             buf += b
-        for d in ml.scan_frames(buf):
+        parsed_end = 0
+        for d in ml.scan_frames(buf, 0):
             ids[d.msgid] = ids.get(d.msgid, 0) + 1
             if d.msgid == 22:  # PARAM_VALUE：解析回显值
                 nm = d.payload[0:16].split(b'\x00')[0].decode(errors='replace')
@@ -163,6 +177,11 @@ def run_params(port):
                 print(f"  -> COMMAND_ACK cmd={int.from_bytes(d.payload[0:2],'little')} result={d.payload[2]}")
             elif d.msgid == 300:  # AUTOPILOT_VERSION
                 print(f"  -> AUTOPILOT_VERSION received (capabilities={int.from_bytes(d.payload[52:60],'little')})")
+            end = d.off + d.total
+            if end > parsed_end:
+                parsed_end = end
+        if parsed_end > 0:
+            del buf[:parsed_end]
     s.close()
     print(f"[RX] 应答统计 ids={ids}")
     ok = True

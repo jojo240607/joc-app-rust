@@ -93,6 +93,13 @@ def main():
 
     print(f"raw={raw} frames={frames} crc_ok={ok} crc_bad={bad} "
           f"seq_dups={seq_dups} seq_jumps={seq_jumps} ids={ids} leftover={len(buf)}")
+    # 下行流混合了上行应答帧（PARAM_VALUE=22 / COMMAND_ACK=77 / AUTOPILOT_VERSION=300）
+    # 是正常现象：它们与遥测帧(HB/LP/SS)共享 usb0 下行 ring。仅当 HB/LP/SS 自身出现
+    # seq_dups>0 或 seq_jumps>0 才表示字节污染；其它 msgid 是合法插入，不是丢帧。
+    other = {k: v for k, v in ids.items() if k not in (0, 32, 1)}
+    if other:
+        print(f"[note] 非遥测帧计数 {other} —— 多为 PARAM_VALUE(22) 等上行应答，属正常混入，"
+              f"非字节污染。seq_dups/seq_jumps 仅针对 HB/LP/SS 各自序列。")
 
 
 if __name__ == "__main__":
