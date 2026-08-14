@@ -41,3 +41,7 @@ usbtest = []
 # 默认关闭：使用 VirtualXxx 虚拟源，无需外接硬件即可闭环调试。
 # 构建：`cargo build --release --features real-sensors`（经 CMake RUST_APP_LIB 注入）。
 real-sensors = []
+
+# ���ɲ��ԣ�Rust �ྭ g_app_slot ��֤ ABI ����·������ verify_app.py ��ϡ�
+integration-test = []
+panic-test = []

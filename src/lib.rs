@@ -26,6 +26,9 @@ pub mod log;
 #[cfg(feature = "usbtest")]
 mod usbtest;
 
+#[cfg(any(feature = "integration-test", feature = "panic-test"))]
+mod intg_test;
+
 use abi::*;
 
 /* ===========================================================================
@@ -76,7 +79,9 @@ pub extern "C" fn rust_app_start() -> i32 {
         crate::demo::spawn_demo();
         #[cfg(feature = "usbtest")]
         crate::usbtest::start();
-        #[cfg(not(any(feature = "demo", feature = "usbtest")))]
+        #[cfg(any(feature = "integration-test", feature = "panic-test"))]
+        crate::intg_test::run_intg_test();
+        #[cfg(not(any(feature = "demo", feature = "usbtest", feature = "integration-test", feature = "panic-test")))]
         crate::flyctrl::spawn_flyctrl();
 
         0

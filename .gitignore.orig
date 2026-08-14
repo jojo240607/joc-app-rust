@@ -8,12 +8,8 @@ _*.py
 _*.log
 _*.txt
 _*.err
-_*.resc
 ocd_*.log
 *ocd_*.log
-
-# Renode 运行日志（build_run_renode.py 输出）
-renode_app*.log
 
 # 构建产物（由 build_app.py 生成，按需提交可删此行）
 app.elf
