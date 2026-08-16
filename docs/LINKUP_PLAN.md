@@ -20,6 +20,9 @@
 | 上行 | PARAM_REQUEST_LIST(21) → PARAM_VALUE(22) 流水 | 5 个参数全回 |
 | 上行 | PARAM_SET(23) / PARAM_REQUEST_READ(20) | 范围校验 + 回显 |
 | 上行 | COMMAND_ACK(77) / AUTOPILOT_VERSION(300) | 正常 |
+| 上行 | **MISSION 航点**：MISSION_COUNT(44)/MISSION_ITEM_INT(73)/MISSION_REQUEST(40)/MISSION_ACK(47)/MISSION_REQUEST_LIST(43) | 上传/下载握手全通（3 航点实测） |
+| 上行 | **RC_CHANNELS_OVERRIDE(70)** | 解析→control 优先取 override，超时 2s 回退 sim RC |
+| 上行 | **FENCE 围栏**：FENCE_POINT(160)/FENCE_FETCH_POINT(161) | 上传/下载 3 顶点实测一致 |
 
 关键解锁点：**`RC_FORCE_ARM` 已改 `false`**（2026-08-16 提交），地面站 DISARM 不再被虚拟 RC 强制 arm 覆盖，**解锁/上锁真正由地面站 COMMAND_LONG 决定**。
 
@@ -29,7 +32,7 @@
 |---|---|---|---|---|
 | 1 | **MISSION 航点** | `upload_mission`/`download_mission`/MISSION_COUNT(44)/MISSION_ITEM_INT(73)/MISSION_REQUEST(40)/MISSION_ACK(47)/MISSION_REQUEST_LIST(43) | 完全未解析（uplink.rs 无对应分支） | **高** |
 | 2 | **RC_CHANNELS_OVERRIDE** | `rc_channels_override` → msg 70 | 未解析；control 仍只读 sim 虚拟 RC | **高** |
-| 3 | **FENCE 围栏** | `upload_fence`/`download_fence`/FENCE_POINT(160)/FENCE_FETCH_POINT(161)/FENCE_COUNT(170) | 未解析 | 中 |
+| 3 | **FENCE 围栏** | `upload_fence`/`download_fence`/FENCE_POINT(160)/FENCE_FETCH_POINT(161)/FENCE_COUNT(170) | ✅ 已解析（160/161）+ 板载存储 | 中 |
 | 4 | **MAVLink FTP 固件升级** | `FILE_TRANSFER_PROTOCOL`(110) + `upload_firmware`/`download_firmware` | 无 FTP 服务端 | 中（需经地面站刷机才要） |
 | 5 | **REQUEST_DATA_STREAM / SET_MESSAGE_INTERVAL** | request_data_stream / set_message_interval | 遥测固定 20ms，不响应流率请求（不致命） | 低 |
 
@@ -37,7 +40,7 @@
 
 ## 2. 实现计划（按优先级）
 
-### 2.1 阶段一：MISSION 航点双向（RC_OVERRIDE 一并做）
+### 2.1 阶段一：MISSION 航点双向（RC_OVERRIDE 一并做）✅ 已完成并实测
 
 目标：地面站能上传/下载航点，并能用 RC 通道覆盖直接操控（替代 sim RC）。
 
@@ -48,10 +51,11 @@
   - 地面站 `download_mission`：发 MISSION_REQUEST_LIST → 板子回 MISSION_COUNT + 逐个 MISSION_ITEM_INT + MISSION_ACK。
 - 新增 `RC_CHANNELS_OVERRIDE`(70) 解析 → 写 `G_RC_OVERRIDE[8]`（`.rust_bss`），control 任务优先取 override（非 0 时覆盖 sim RC）。
 
-### 2.2 阶段二：FENCE 围栏
+### 2.2 阶段二：FENCE 围栏 ✅ 已完成并实测
 
-- FENCE_COUNT / FENCE_POINT / FENCE_FETCH_POINT 路由 + 板载围栏存储。
-- 注意：地面站 `mlink/mission.rs` 已**手写 FENCE_POINT 编解码**（绕过 mavlink crate 字段顺序 bug），板子端需与之字节级对齐（先用 `verify_*` 对拍）。
+- FENCE_COUNT(170)/FENCE_POINT(160)/FENCE_FETCH_POINT(161) 路由 + 板载围栏存储（`.rust_bss` 静态数组 `G_FENCE[64]` + `G_FENCE_COUNT`）。
+- 握手：地面站上传 FENCE_POINT(160) → 板子按 idx 存储（最后一条的 count 字段定总数）；下载 FENCE_FETCH_POINT(161) → 板子回 FENCE_POINT(160)（含 count）。
+- 注意：板子端 FENCE 协议按**标准 MAVLink 字段顺序**（lat/lon 为 i32 *1e7），与地面站 `mlink/fence.rs` 手写编解码字节级对齐（实测 3 顶点一致）。
 
 ### 2.3 阶段三：MAVLink FTP 固件升级（可选）
 
@@ -82,9 +86,9 @@
 - [x] 下行 6 帧字节级 CRC 全对、seq 单调
 - [x] ARM/DISARM 由地面站命令决定（RC_FORCE_ARM=false）
 - [x] 参数读写闭环
-- [ ] **MISSION 上传/下载**：地面站 `upload_mission` 后板子存 N 个航点；`download_mission` 回同样 N 个
-- [ ] **RC_OVERRIDE**：地面站发通道覆盖后 control 实际读到（替代 sim RC）
-- [ ] **FENCE 上传/下载**：围栏点一致
+- [x] **MISSION 上传/下载**：地面站 `upload_mission` 后板子存 N 个航点；`download_mission` 回同样 N 个（3 航点实测全通）
+- [x] **RC_OVERRIDE**：地面站发通道覆盖后 control 实际读到（替代 sim RC）
+- [x] **FENCE 上传/下载**：围栏点一致（3 顶点实测全通）
 - [ ] （可选）FTP 固件升级经地面站跑通
 
 ---
@@ -98,3 +102,9 @@
   - ✅ uplink.rs：MISSION 握手状态机（upload/download）+ RC_OVERRIDE 全局 + get_rc_override() 接口；路由分支已接。
   - ✅ control.rs：RC_OVERRIDE 优先于 sim RC（PWM 1000-2000 归一化），超时 2s 回退 sim RC。
   - ⏳ 待烧录实测：groundctrl 实连验证 MISSION 上传/下载 + RC_OVERRIDE 操控。
+
+- **2026-08-16（续）**：阶段一实测通过（烧录后 `verify_mission.py` COM12 上传/下载 3 航点全通 + COM8 板子日志 MISSION_REQUEST/ACK/RC_OVERRIDE valid 确认）；阶段二 FENCE 围栏实现并实测通过（`tools/verify_fence.py` COM12 上传/下载 3 顶点一致 + COM8 板子日志 FENCE_POINT/FENCE_FETCH_POINT 确认）。
+  - ✅ flyctrl-core mavlink.rs：新增 FENCE_POINT(160)/FENCE_FETCH_POINT(161) msg_id、CRC_EXTRA(78/68)、decode_fence_point/decode_fence_fetch_point/encode_fence_point + FencePoint 结构体。
+  - ✅ uplink.rs：G_FENCE[64] + G_FENCE_COUNT 静态存储 + fence_handle_point/fence_handle_fetch 路由分支 + get_fence_count/get_fence_point 接口。
+  - ✅ tools/mavlink.py：补 FENCE CRC_EXTRA + enc_fence_point/enc_fence_fetch_point；新增 verify_fence.py 验证脚本。
+  - 剩余待做：阶段三 FTP、阶段四 SET_MESSAGE_INTERVAL（均低优先，非联调瓶颈）。

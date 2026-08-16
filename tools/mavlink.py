@@ -34,6 +34,8 @@ CRC_EXTRA = {
     47: 153,  # MISSION_ACK
     70: 124,  # RC_CHANNELS_OVERRIDE
     73: 38,   # MISSION_ITEM_INT
+    160: 78,   # FENCE_POINT
+    161: 68,   # FENCE_FETCH_POINT
 }
 
 MAGIC = 0xFD
@@ -114,6 +116,21 @@ def enc_rc_channels_override(ch, seq):
         p[2 + i*2:4 + i*2] = ch[i].to_bytes(2, 'little')
     p[18] = 0  # rssi
     return frame(70, bytes(p), seq)
+
+def enc_fence_point(idx, count, lat, lon, seq):
+    """FENCE_POINT(160)：12B。idx/count(u8)，lat/lon(i32, *1e7)。"""
+    p = bytearray(12)
+    p[0] = 1; p[1] = 1
+    p[2] = idx
+    p[3] = count
+    p[4:8] = lat.to_bytes(4, 'little', signed=True)
+    p[8:12] = lon.to_bytes(4, 'little', signed=True)
+    return frame(160, bytes(p), seq)
+
+def enc_fence_fetch_point(idx, seq):
+    """FENCE_FETCH_POINT(161)：3B。idx(u8)。"""
+    p = bytes([1, 1, idx])
+    return frame(161, p, seq)
 
 
 def find_cdc():

@@ -60,6 +60,17 @@ const MISSION_MAX: usize = 64;
 const RCV_IDLE: u8 = 0;
 const RCV_WAIT_ITEM: u8 = 1;
 
+// ── 围栏（FENCE）存储 + 握手状态机全局 ─────────────────────────────
+/// 板载围栏顶点存储（固定数组，无堆）。最多 64 个顶点（含闭合点）。
+/// 复用 flyctrl_core::comm::mavlink::FencePoint。
+#[link_section = ".rust_bss"]
+static mut G_FENCE: [mavlink::FencePoint; FENCE_MAX] =
+    [mavlink::FencePoint { target_system: 0, target_component: 0, idx: 0, count: 0, lat: 0, lon: 0 }; FENCE_MAX];
+/// 当前已存储围栏顶点数。
+#[link_section = ".rust_bss"]
+static mut G_FENCE_COUNT: u8 = 0;
+const FENCE_MAX: usize = 64;
+
 // ── RC 通道覆盖全局 ──────────────────────────────────────────────────
 /// 地面站经 RC_CHANNELS_OVERRIDE 下发的 8 通道 PWM（微秒，1000-2000）。
 /// `valid != 0` 表示 override 生效（control 任务据此优先于 sim RC）。
@@ -341,6 +352,17 @@ fn route_frame(dev: &Device, seq: &mut u8, msgid: u32, payload: &[u8]) {
                 mission_handle_item(dev, &item);
             }
         }
+        // ── 围栏（FENCE）握手 ──────────────────────────────────
+        mavlink::msg_id::FENCE_POINT => {
+            if let Some(pt) = mavlink::decode_fence_point(payload) {
+                fence_handle_point(&pt);
+            }
+        }
+        mavlink::msg_id::FENCE_FETCH_POINT => {
+            if let Some(idx) = mavlink::decode_fence_fetch_point(payload) {
+                fence_handle_fetch(dev, idx);
+            }
+        }
         // ── RC 通道覆盖（地面站手动操控）──────────────────────────
         mavlink::msg_id::RC_CHANNELS_OVERRIDE => {
             if let Some(ch) = mavlink::decode_rc_channels_override(payload) {
@@ -496,6 +518,52 @@ fn mission_handle_item(dev: &Device, item: &mavlink::MissionItem) {
         let _ = send_frame(dev, &out, n);
         info!(tag: "uplink", "MISSION item seq={} stored, requesting seq={}", item.seq, next2);
     }
+}
+
+// ── 围栏（FENCE）握手处理函数 ─────────────────────────────────────
+/// FENCE 下载：地面站请求某条围栏顶点 -> 回 FENCE_POINT（含 count）。
+fn fence_handle_fetch(dev: &Device, idx: u8) {
+    let count = unsafe { G_FENCE_COUNT };
+    if idx as usize >= count as usize {
+        info!(tag: "uplink", "FENCE_FETCH idx={} >= count={} -> ignored", idx, count);
+        return;
+    }
+    let pt = unsafe { G_FENCE[idx as usize] };
+    let mut out = [0u8; ML_MAX];
+    let n = mavlink::encode_fence_point(&pt, &mut out);
+    let _ = send_frame(dev, &out, n);
+    info!(tag: "uplink", "FENCE_FETCH idx={} -> lat={} lon={} (count={})", idx, pt.lat, pt.lon, count);
+}
+
+/// FENCE 上传：地面站发单条 FENCE_POINT -> 存储（idx 即写入位置），count 到齐即收尾。
+fn fence_handle_point(pt: &mavlink::FencePoint) {
+    let idx = pt.idx as usize;
+    if idx >= FENCE_MAX {
+        info!(tag: "uplink", "FENCE_POINT idx={} >= FENCE_MAX -> ignored", idx);
+        return;
+    }
+    unsafe {
+        G_FENCE[idx] = *pt;
+        // 以 idx+1 作为当前总数（地面站按顺序上传，最后一条的 count 即总点数）。
+        if pt.count as usize > G_FENCE_COUNT as usize {
+            G_FENCE_COUNT = pt.count;
+        }
+        if (idx + 1) as u8 > G_FENCE_COUNT {
+            G_FENCE_COUNT = (idx + 1) as u8;
+        }
+    }
+    info!(tag: "uplink", "FENCE_POINT idx={} lat={} lon={} count={} -> stored", idx, pt.lat, pt.lon, pt.count);
+}
+
+/// 读取围栏顶点数（control 任务或 telemetry 可调用）。
+pub fn get_fence_count() -> u8 {
+    unsafe { G_FENCE_COUNT }
+}
+
+/// 读取围栏顶点（地面站下载用，已由 FENCE_FETCH_POINT 直接经 encode 发出）。
+pub fn get_fence_point(idx: usize) -> Option<mavlink::FencePoint> {
+    if idx >= unsafe { G_FENCE_COUNT } as usize { return None; }
+    Some(unsafe { G_FENCE[idx] })
 }
 
 /// 读取 RC_OVERRIDE（control 任务调用）：返回 (ch[8], valid)。
