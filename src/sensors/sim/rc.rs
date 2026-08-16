@@ -8,11 +8,15 @@ use flyctrl_core::vehicle::RcInput;
 
 use crate::sensors::sim::dataset::{Frame, PLAYBACK};
 
-/// 虚拟数据闭环演示开关：虚拟 RC 强制 `armed=true`，使控制律 PID→PWM 闭环真正执行。
-/// 数据集 `rc` 通道无 armed 位，正常回放语义应为 false（飞控不输出推力）。
-/// 当前保留为 `true`：以纯虚拟数据集驱动姿态解算→PID→PWM 整链路闭环演示，
-/// 用于板上验证飞控算法在无需真实硬件传感器时也能正常运行。
-const RC_FORCE_ARM: bool = true;
+/// 虚拟 RC 的 armed 默认。
+///
+/// 必须为 `false`：否则虚拟 RC 强行 `armed=true` 会让控制律的解锁逻辑
+/// `armed_eff = rc_armed || cmd_armed` 永远为 true，地面站经 COMMAND_LONG
+/// (ARM/DISARM) 发出的 DISARM 被 OR 掉而失效，无法通过地面站解锁/上锁。
+///
+/// 解锁改由地面站指令 `G_CMD_ARMED` 唯一决定（虚拟/联调环境下 RC 不应强制 arm）。
+/// 纯虚拟数据集演示整链路闭环时，通过地面站发送 ARM 即可获得推力输出。
+const RC_FORCE_ARM: bool = false;
 
 pub struct VirtualRc;
 

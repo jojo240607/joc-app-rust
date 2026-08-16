@@ -14,6 +14,33 @@
   python tools/verify_uplink.py [PORT]                 # 默认 --arm 模式
   python tools/verify_uplink.py COM12 --test
   python tools/verify_uplink.py COM12 --arm
+
+============================================================================
+测试前置条件 + 常见坑（已踩过，务必先读）：
+============================================================================
+1) 板子必须处于 RUN 态，不是 halt 态。
+   flash_app.py 烧录后会留板子在 halt 态（monitor reset halt），必须先
+   `monitor reset run` 救活（或用 _ocd_run.cfg + _rr.gdb 复位运行），
+   否则板子不跑 App、COM8 无输出、COM12 不枚举。
+
+2) COM8(COM 日志) 和 COM12(USB CDC) 都不能被其他进程占用。
+   串口助手 / 旧的 python 监听进程开着会导致读到 0 字节或板子无输出。
+   用 pyserial 打开端口后务必 s.dtr=False; s.rts=False（防 DTR 脉冲复位）。
+
+3) 【关键坑】不要用 GDB halt 快照判断"uplink 是否读到数据"。
+   uplink 每 10ms 非阻塞 poll usb0.read，host 不发命令时 ring 恒空 -> read 返回 0
+   是【常态】。曾误把"halt 快照看到 read 返回 0"当成 bug，实际是 host 没发数据。
+   正确的验证方式：用本脚本 --arm 持续发命令（每 1s 切换），同时用 listen.py
+   抓 COM8，应看到：
+       uplink: RX raw n=45 ...
+       uplink: frame decoded msgid=76 plen=45
+       uplink: ARM_DISARM cmd=400 -> armed=true/false
+   或直接看本脚本输出 base_mode 统计出现 0x81。
+
+4) 一次性的单发命令可能被 uplink 的 10ms 轮询"错过"（host 发完、ring 被后续
+   状态覆盖前 uplink 没赶上读）。务必用持续发送（本脚本 --arm 默认 12s 循环）验证，
+   不要发一次就断言失败。
+============================================================================
 """
 import argparse
 import struct

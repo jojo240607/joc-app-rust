@@ -183,6 +183,7 @@ impl UplinkTx {
     /// 非阻塞轮询一次 usb0.read，喂入增量解析器；每闭合一帧即路由。
     fn poll_read(&mut self, buf: &mut [u8]) {
         let n = self.dev.read(buf);
+        // 诊断：只在真正读到字节时打印（含 n==0 的噪声会淹没串口，去掉）。
         // 防御：驱动 read 可能返回负数错误码或异常长度；只在 0 < n <= buf.len() 时解析，
         // 否则跳过（避免切片越界），不阻塞轮询。
         if n > 0 && (n as usize) <= buf.len() {
@@ -214,7 +215,9 @@ impl UplinkTx {
 /// 非阻塞写出一帧；host 不连/无 IN-token 时 usb write 返回 0（丢帧），不阻塞。
 fn send_frame(dev: &Device, out: &[u8; ML_MAX], n: usize) -> i32 {
     let r = dev.write(&out[..n]);
-    info!(tag: "uplink", "send_frame n={} ret={}", n, r);
+    if r <= 0 {
+        info!(tag: "uplink", "send_frame FAILED n={} ret={}", n, r);
+    }
     r
 }
 
