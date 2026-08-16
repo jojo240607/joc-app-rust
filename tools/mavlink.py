@@ -36,6 +36,8 @@ CRC_EXTRA = {
     73: 38,   # MISSION_ITEM_INT
     160: 78,   # FENCE_POINT
     161: 68,   # FENCE_FETCH_POINT
+    66: 148,    # REQUEST_DATA_STREAM
+    67: 21,     # DATA_STREAM
 }
 
 MAGIC = 0xFD
@@ -72,6 +74,17 @@ def frame(msgid, payload, seq, sys_id=SYS_ID, comp_id=COMP_ID):
 def f32(b):
     import struct
     return struct.pack('<f', b)
+
+def enc_command_long(command, p1=0, p2=0, p3=0, p4=0, p5=0, p6=0, p7=0, seq=0, confirmation=0):
+    """COMMAND_LONG(76)：33B。target_system, target_component, command(u16),
+    confirmation, param1-7 (f32 LE)。"""
+    p = bytearray(33)
+    p[0] = 1; p[1] = 1
+    p[2:4] = command.to_bytes(2, 'little')
+    p[4] = confirmation
+    for i, v in enumerate([p1, p2, p3, p4, p5, p6, p7]):
+        p[5 + i*4:9 + i*4] = f32(v)
+    return frame(76, bytes(p), seq)
 
 def enc_mission_count(count, seq):
     """MISSION_COUNT(44)：target_system, target_component, count(u16)。"""
@@ -131,6 +144,20 @@ def enc_fence_fetch_point(idx, seq):
     """FENCE_FETCH_POINT(161)：3B。idx(u8)。"""
     p = bytes([1, 1, idx])
     return frame(161, p, seq)
+
+def enc_request_data_stream(stream_id, rate_hz, start_stop, seq):
+    """REQUEST_DATA_STREAM(66)：6B。stream_id(u8), rate(u16), ts, tc, start_stop(u8)。"""
+    p = bytearray(6)
+    p[0] = stream_id
+    p[1:3] = rate_hz.to_bytes(2, 'little')
+    p[3] = 1  # target_system
+    p[4] = 1  # target_component
+    p[5] = start_stop
+    return frame(66, bytes(p), seq)
+
+def enc_set_message_interval(msg_id, interval_us, seq):
+    """SET_MESSAGE_INTERVAL 经 COMMAND_LONG(76) 的 MAV_CMD=203。"""
+    return enc_command_long(203, msg_id, interval_us, 0, 0, 0, 0, 0, seq)
 
 
 def find_cdc():

@@ -23,6 +23,7 @@
 | 上行 | **MISSION 航点**：MISSION_COUNT(44)/MISSION_ITEM_INT(73)/MISSION_REQUEST(40)/MISSION_ACK(47)/MISSION_REQUEST_LIST(43) | 上传/下载握手全通（3 航点实测） |
 | 上行 | **RC_CHANNELS_OVERRIDE(70)** | 解析→control 优先取 override，超时 2s 回退 sim RC |
 | 上行 | **FENCE 围栏**：FENCE_POINT(160)/FENCE_FETCH_POINT(161) | 上传/下载 3 顶点实测一致 |
+| 上行 | **数据流速率控制**：REQUEST_DATA_STREAM(66) → 回 DATA_STREAM(67)；SET_MESSAGE_INTERVAL(511/CMD 203) → 回 COMMAND_ACK(77) | 接收并正确应答（板子遥测暂固定 20ms，记录间隔请求，不动态改频率） |
 
 关键解锁点：**`RC_FORCE_ARM` 已改 `false`**（2026-08-16 提交），地面站 DISARM 不再被虚拟 RC 强制 arm 覆盖，**解锁/上锁真正由地面站 COMMAND_LONG 决定**。
 
@@ -30,11 +31,7 @@
 
 | # | 功能 | 地面站侧 | 板子端现状 | 优先级 |
 |---|---|---|---|---|
-| 1 | **MISSION 航点** | `upload_mission`/`download_mission`/MISSION_COUNT(44)/MISSION_ITEM_INT(73)/MISSION_REQUEST(40)/MISSION_ACK(47)/MISSION_REQUEST_LIST(43) | 完全未解析（uplink.rs 无对应分支） | **高** |
-| 2 | **RC_CHANNELS_OVERRIDE** | `rc_channels_override` → msg 70 | 未解析；control 仍只读 sim 虚拟 RC | **高** |
-| 3 | **FENCE 围栏** | `upload_fence`/`download_fence`/FENCE_POINT(160)/FENCE_FETCH_POINT(161)/FENCE_COUNT(170) | ✅ 已解析（160/161）+ 板载存储 | 中 |
-| 4 | **MAVLink FTP 固件升级** | `FILE_TRANSFER_PROTOCOL`(110) + `upload_firmware`/`download_firmware` | 无 FTP 服务端 | 中（需经地面站刷机才要） |
-| 5 | **REQUEST_DATA_STREAM / SET_MESSAGE_INTERVAL** | request_data_stream / set_message_interval | 遥测固定 20ms，不响应流率请求（不致命） | 低 |
+| 1 | **MAVLink FTP 固件升级** | `FILE_TRANSFER_PROTOCOL`(110) + `upload_firmware`/`download_firmware` | 无 FTP 服务端 | 中（需经地面站刷机才要，**依赖板子 bootloader，暂缓**） |
 
 ---
 
@@ -57,14 +54,17 @@
 - 握手：地面站上传 FENCE_POINT(160) → 板子按 idx 存储（最后一条的 count 字段定总数）；下载 FENCE_FETCH_POINT(161) → 板子回 FENCE_POINT(160)（含 count）。
 - 注意：板子端 FENCE 协议按**标准 MAVLink 字段顺序**（lat/lon 为 i32 *1e7），与地面站 `mlink/fence.rs` 手写编解码字节级对齐（实测 3 顶点一致）。
 
-### 2.3 阶段三：MAVLink FTP 固件升级（可选）
+### 2.3 阶段三：MAVLink FTP 固件升级（可选，**暂缓**）
 
 - 板子实现最小 FTP 服务端：`FILE_TRANSFER_PROTOCOL` 解析 + 经 `flash` 驱动写 spare sector。
-- 仅当需经地面站刷机时实现；否则保持 USB CDC 仅做遥测/指令。
+- **暂缓原因**：板子 bootloader 尚未实现，FTP 固件升级经地面站刷机的前提不存在；待 bootloader 完成后再做。
+- 当前保持 USB CDC 仅做遥测/指令。
 
-### 2.4 阶段四（低优先）：SET_MESSAGE_INTERVAL
+### 2.4 阶段四（低优先）：SET_MESSAGE_INTERVAL / REQUEST_DATA_STREAM ✅ 已完成并实测
 
-- 板子维护 per-msgid 间隔表，telemetry 按表发；或最简：固定 20ms 不变，ACK 一下忽略间隔。
+- REQUEST_DATA_STREAM(66)：解析并回 DATA_STREAM(67)（on_off 随 start_stop/rate）。
+- SET_MESSAGE_INTERVAL(511，经 COMMAND_LONG command=203)：解析并回 COMMAND_ACK(77 ACCEPTED)。
+- 板子遥测暂固定 20ms 周期；请求仅记录到 `G_MSG_INTERVAL[256]` 静态表（`.rust_bss`），未动态改频率（后续可接入 telemetry）。
 
 ---
 
@@ -89,7 +89,8 @@
 - [x] **MISSION 上传/下载**：地面站 `upload_mission` 后板子存 N 个航点；`download_mission` 回同样 N 个（3 航点实测全通）
 - [x] **RC_OVERRIDE**：地面站发通道覆盖后 control 实际读到（替代 sim RC）
 - [x] **FENCE 上传/下载**：围栏点一致（3 顶点实测全通）
-- [ ] （可选）FTP 固件升级经地面站跑通
+- [x] **数据流速率控制**：REQUEST_DATA_STREAM → 回 DATA_STREAM；SET_MESSAGE_INTERVAL → 回 COMMAND_ACK（实测全通）
+- [ ] （可选，暂缓）FTP 固件升级经地面站跑通（依赖 bootloader）
 
 ---
 
@@ -108,3 +109,10 @@
   - ✅ uplink.rs：G_FENCE[64] + G_FENCE_COUNT 静态存储 + fence_handle_point/fence_handle_fetch 路由分支 + get_fence_count/get_fence_point 接口。
   - ✅ tools/mavlink.py：补 FENCE CRC_EXTRA + enc_fence_point/enc_fence_fetch_point；新增 verify_fence.py 验证脚本。
   - 剩余待做：阶段三 FTP、阶段四 SET_MESSAGE_INTERVAL（均低优先，非联调瓶颈）。
+
+- **2026-08-16（续2）**：阶段四 数据流速率控制实现并实测通过（`tools/verify_stream.py` COM12：REQUEST_DATA_STREAM→DATA_STREAM、SET_MESSAGE_INTERVAL→COMMAND_ACK 均 OK + COM8 板子日志确认）。
+  - ✅ flyctrl-core mavlink.rs：新增 REQUEST_DATA_STREAM(66)/DATA_STREAM(67) msg_id、CRC_EXTRA(148/21)、decode_request_data_stream / encode_data_stream；MAV_CMD_SET_MESSAGE_INTERVAL(203) 复用 enums 常量。
+  - ✅ uplink.rs：REQUEST_DATA_STREAM 路由分支（回 DATA_STREAM）+ COMMAND_LONG(command=203) 分支（回 COMMAND_ACK + 记录到 G_MSG_INTERVAL[256] 静态表）。
+  - ✅ tools/mavlink.py：补 DATA_STREAM CRC_EXTRA + enc_request_data_stream / enc_command_long（COMMAND_LONG 构造）；新增 verify_stream.py 验证脚本。
+  - 阶段三 FTP 暂缓（依赖板子 bootloader，尚未实现）。
+  - 联调计划当前状态：阶段一/二/四 已端到端实测通过；阶段三 FTP 待 bootloader 完成后推进。

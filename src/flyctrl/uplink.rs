@@ -90,6 +90,19 @@ fn app_ticks() -> u32 {
     unsafe { G_APP_TICKS }
 }
 
+// ── SET_MESSAGE_INTERVAL 静态存储 ───────────────────────────────────
+/// 记录地面站经 MAV_CMD_SET_MESSAGE_INTERVAL 设置的 per-msgid 间隔（微秒）。
+/// 0 = 未设置/默认（20ms 固定周期）。板子遥测暂固定 20ms，此处仅记录、预留给后续接入。
+#[link_section = ".rust_bss"]
+static mut G_MSG_INTERVAL: [i32; 256] = [0; 256];
+
+/// 记录某消息的目标间隔（微秒）。索引为 msg_id（仅 0..255 有效）。
+fn set_message_interval(msg_id: u32, interval_us: i32) {
+    if msg_id < 256 {
+        unsafe { G_MSG_INTERVAL[msg_id as usize] = interval_us; }
+    }
+}
+
 // ── 增量帧解析器（单字节状态机，无堆） ────────────────────────────────
 #[derive(Clone, Copy, PartialEq)]
 enum FxState {
@@ -363,6 +376,17 @@ fn route_frame(dev: &Device, seq: &mut u8, msgid: u32, payload: &[u8]) {
                 fence_handle_fetch(dev, idx);
             }
         }
+        // ── 数据流速率控制（REQUEST_DATA_STREAM / DATA_STREAM）────────
+        mavlink::msg_id::REQUEST_DATA_STREAM => {
+            if let Some((stream_id, rate_hz, start_stop)) = mavlink::decode_request_data_stream(payload) {
+                // 板子遥测固定 20ms；以请求的 rate 回 DATA_STREAM 确认（on_off 随 start_stop）。
+                let on_off: u8 = if start_stop > 0 && rate_hz > 0 { 1 } else { 0 };
+                let mut out = [0u8; ML_MAX];
+                let n = mavlink::encode_data_stream(stream_id, rate_hz, on_off, &mut out);
+                let _ = send_frame(dev, &out, n);
+                info!(tag: "uplink", "REQUEST_DATA_STREAM stream={} rate={}Hz on={} -> DATA_STREAM", stream_id, rate_hz, on_off);
+            }
+        }
         // ── RC 通道覆盖（地面站手动操控）──────────────────────────
         mavlink::msg_id::RC_CHANNELS_OVERRIDE => {
             if let Some(ch) = mavlink::decode_rc_channels_override(payload) {
@@ -428,6 +452,16 @@ fn handle_command_long(dev: &Device, seq: &mut u8, cmd: CommandLong) {
             G_CAP_REQ.store(true, Ordering::Relaxed);
             ack(dev, seq, cmd.command, enums::MAV_RESULT_ACCEPTED);
             info!(tag: "uplink", "REQUEST_AUTOPILOT_CAPABILITIES rx");
+        }
+        enums::MAV_CMD_SET_MESSAGE_INTERVAL => {
+            // param1 = msg_id（要改频率的消息），param2 = interval_us（0=停止）。
+            // 板子遥测为固定 20ms 周期，此处仅记录请求并 ACK 确认；
+            // 真正的动态间隔（per-msgid 表）留待后续可视需要接入 telemetry。
+            let target_msg: u32 = cmd.params[0] as u32;
+            let interval_us: i32 = cmd.params[1] as i32;
+            set_message_interval(target_msg, interval_us);
+            ack(dev, seq, cmd.command, enums::MAV_RESULT_ACCEPTED);
+            info!(tag: "uplink", "SET_MESSAGE_INTERVAL msg={} interval_us={} -> ACK", target_msg, interval_us);
         }
         _ => {
             // 第一版未实现的指令：明确拒绝（便于地面站诊断）
