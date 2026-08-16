@@ -9,7 +9,7 @@ use flyctrl_core::controller::{Controller, PidController, Setpoint};
 use flyctrl_core::estimator::{Estimator, EkfEstimator};
 use flyctrl_core::fdir::{Fdir, Health};
 use flyctrl_core::units::{Meter, MeterPerSecond, Radian, Second};
-use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, VehicleState};
+use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, RcInput, VehicleState};
 
 use crate::abi::RTOS_PRIO_BH_HIGH;
 use crate::device::Device;
@@ -95,6 +95,28 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         let cmd_armed = crate::flyctrl::uplink::G_CMD_ARMED.load(Ordering::Relaxed);
         let armed_eff = armed || cmd_armed;
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: sen-mtx got"); }
+
+        // 地面站 RC 通道覆盖（RC_CHANNELS_OVERRIDE）：生效时以地面站通道优先于 sim RC。
+        // 通道映射：ch1=roll, ch2=pitch, ch3=throttle, ch4=yaw（标准 MAVLink 约定）。
+        // PWM 1000-2000us 归一化到 0.0-1.0。
+        let (rc_ov, rc_ov_valid) = crate::flyctrl::uplink::get_rc_override();
+        let rc = if rc_ov_valid {
+            let norm = |pwm: u16| -> f32 {
+                let v = (pwm as f32 - 1000.0) / 1000.0;
+                v.clamp(0.0, 1.0)
+            };
+            RcInput {
+                throttle: norm(rc_ov[2]),
+                roll: norm(rc_ov[0]),
+                pitch: norm(rc_ov[1]),
+                yaw: norm(rc_ov[3]),
+                armed: rc_ov[0] > 1500, // 暂以 ch1 高位作为地面站解锁指示（占位，主解锁仍靠 COMMAND_LONG）
+                mode: rc.mode,
+                fresh: true,
+            }
+        } else {
+            rc
+        };
 
         // IMU 缺失 → 模拟源（总线异常降级）
         let imu_sample: ImuSample = match imu {

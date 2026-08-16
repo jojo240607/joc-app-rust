@@ -27,6 +27,13 @@ CRC_EXTRA = {
     74: 20,   # VFR_HUD             (标准 common.xml)
     76: 152,  # COMMAND_LONG
     77: 143,  # COMMAND_ACK         (标准 common.xml；旧脚本误用 208)
+    40: 230,  # MISSION_REQUEST
+    43: 132,  # MISSION_REQUEST_LIST
+    44: 221,  # MISSION_COUNT
+    45: 232,  # MISSION_CLEAR_ALL
+    47: 153,  # MISSION_ACK
+    70: 124,  # RC_CHANNELS_OVERRIDE
+    73: 38,   # MISSION_ITEM_INT
 }
 
 MAGIC = 0xFD
@@ -57,6 +64,56 @@ def frame(msgid, payload, seq, sys_id=SYS_ID, comp_id=COMP_ID):
     c = crc16(0xFFFF, body[1:])          # 从 len 字节起，跳过 magic
     c = crc16(c, [CRC_EXTRA.get(msgid, 0)])
     return body + bytes([c & 0xFF, (c >> 8) & 0xFF])
+
+
+# ── MISSION / RC_OVERRIDE 上行构造辅助 ──────────────────────────────
+def f32(b):
+    import struct
+    return struct.pack('<f', b)
+
+def enc_mission_count(count, seq):
+    """MISSION_COUNT(44)：target_system, target_component, count(u16)。"""
+    p = bytes([1, 1]) + count.to_bytes(2, 'little')
+    return frame(44, p, seq)
+
+def enc_mission_request(seq_req, seq):
+    """MISSION_REQUEST(40)：target_system, target_component, seq(u16)。"""
+    p = bytes([1, 1]) + seq_req.to_bytes(2, 'little')
+    return frame(40, p, seq)
+
+def enc_mission_item_int(item, seq):
+    """MISSION_ITEM_INT(73)：37B 标准布局。
+    item: dict{seq,command,param1..4,x,y,z,frame,current,autocontinue}
+    """
+    p = bytearray(37)
+    p[0] = 1; p[1] = 1
+    p[2:4] = item['seq'].to_bytes(2, 'little')
+    p[4] = item.get('frame', 3)         # MAV_FRAME_GLOBAL_INT
+    p[5:7] = item['command'].to_bytes(2, 'little')
+    p[7] = item.get('current', 0)
+    p[8] = item.get('autocontinue', 1)
+    p[9:13] = f32(item.get('param1', 0.0))
+    p[13:17] = f32(item.get('param2', 0.0))
+    p[17:21] = f32(item.get('param3', 0.0))
+    p[21:25] = f32(item.get('param4', 0.0))
+    p[25:29] = item['x'].to_bytes(4, 'little', signed=True)
+    p[29:33] = item['y'].to_bytes(4, 'little', signed=True)
+    p[33:37] = f32(item.get('z', 0.0))
+    # mission_type 在 v2 扩展字段，此处省略（与固件 decode 一致：未读末尾扩展）
+    return frame(73, bytes(p), seq)
+
+def enc_mission_request_list(seq):
+    """MISSION_REQUEST_LIST(43)：target_system, target_component。"""
+    return frame(43, bytes([1, 1]), seq)
+
+def enc_rc_channels_override(ch, seq):
+    """RC_CHANNELS_OVERRIDE(70)：21B。ch=[c1..c8] 为 PWM 微秒值。"""
+    p = bytearray(21)
+    p[0] = 1; p[1] = 1
+    for i in range(8):
+        p[2 + i*2:4 + i*2] = ch[i].to_bytes(2, 'little')
+    p[18] = 0  # rssi
+    return frame(70, bytes(p), seq)
 
 
 def find_cdc():

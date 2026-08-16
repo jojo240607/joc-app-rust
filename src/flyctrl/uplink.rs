@@ -37,6 +37,48 @@ pub static G_PARAM_REQ: AtomicBool = AtomicBool::new(false);
 /// 地面站请求自驾仪能力（COMMAND_LONG REQUEST_AUTOPILOT_CAPABILITIES）。
 pub static G_CAP_REQ: AtomicBool = AtomicBool::new(false);
 
+// ── 航点（MISSION）存储 + 握手状态机全局 ─────────────────────────────
+/// 板载航点存储（固定数组，无堆）。最多 64 条航点（地面站常见任务规模足够）。
+/// 复用 flyctrl_core::comm::mavlink::MissionItem（含 target_system 等完整字段）。
+#[link_section = ".rust_bss"]
+static mut G_MISSION: [mavlink::MissionItem; MISSION_MAX] =
+    [mavlink::MissionItem { target_system: 0, target_component: 0, seq: 0, command: 0,
+        param1: 0.0, param2: 0.0, param3: 0.0, param4: 0.0, x: 0, y: 0, z: 0.0, frame: 0, current: 0, autocontinue: 0, mission_type: 0 }; MISSION_MAX];
+/// 当前已存储航点数。
+#[link_section = ".rust_bss"]
+static mut G_MISSION_COUNT: u16 = 0;
+/// 接收握手状态：RCV_IDLE=0 不在接收；RCV_WAIT_ITEM=1 等 MISSION_ITEM_INT。
+#[link_section = ".rust_bss"]
+static mut G_MISSION_RCV_STATE: u8 = 0;
+/// 接收握手中期望的下一个 seq（upload 时递增）。
+#[link_section = ".rust_bss"]
+static mut G_MISSION_RCV_NEXT: u16 = 0;
+/// 接收握手目标总数（来自 MISSION_COUNT）。
+#[link_section = ".rust_bss"]
+static mut G_MISSION_RCV_TOTAL: u16 = 0;
+const MISSION_MAX: usize = 64;
+const RCV_IDLE: u8 = 0;
+const RCV_WAIT_ITEM: u8 = 1;
+
+// ── RC 通道覆盖全局 ──────────────────────────────────────────────────
+/// 地面站经 RC_CHANNELS_OVERRIDE 下发的 8 通道 PWM（微秒，1000-2000）。
+/// `valid != 0` 表示 override 生效（control 任务据此优先于 sim RC）。
+#[link_section = ".rust_bss"]
+static mut G_RC_OVERRIDE: [u16; 8] = [0; 8];
+#[link_section = ".rust_bss"]
+static mut G_RC_OVERRIDE_VALID: u8 = 0;
+/// override 新鲜度时间戳（App 单调 ticks，单位 10ms）；control 任务据此判断超时（>200 即 2s 失效）。
+#[link_section = ".rust_bss"]
+static mut G_RC_OVERRIDE_TICK: u32 = 0;
+/// 全局 App 单调 tick（每 10ms 由 uplink 主循环 +1）；供 RC_OVERRIDE 超时判断。
+#[link_section = ".rust_bss"]
+static mut G_APP_TICKS: u32 = 0;
+
+/// App 单调 tick 计数（单位 10ms）。uplink 主循环每轮 +1，control 任务读取判断超时。
+fn app_ticks() -> u32 {
+    unsafe { G_APP_TICKS }
+}
+
 // ── 增量帧解析器（单字节状态机，无堆） ────────────────────────────────
 #[derive(Clone, Copy, PartialEq)]
 enum FxState {
@@ -285,6 +327,31 @@ fn route_frame(dev: &Device, seq: &mut u8, msgid: u32, payload: &[u8]) {
                 }
             }
         }
+        // ── 航点（MISSION）握手 ──────────────────────────────────
+        mavlink::msg_id::MISSION_REQUEST_LIST => {
+            mission_handle_request_list(dev);
+        }
+        mavlink::msg_id::MISSION_COUNT => {
+            if let Some(count) = mavlink::decode_mission_count(payload) {
+                mission_handle_count(dev, count);
+            }
+        }
+        mavlink::msg_id::MISSION_ITEM_INT => {
+            if let Some(item) = mavlink::decode_mission_item_int(payload) {
+                mission_handle_item(dev, &item);
+            }
+        }
+        // ── RC 通道覆盖（地面站手动操控）──────────────────────────
+        mavlink::msg_id::RC_CHANNELS_OVERRIDE => {
+            if let Some(ch) = mavlink::decode_rc_channels_override(payload) {
+                unsafe {
+                    G_RC_OVERRIDE = ch;
+                    G_RC_OVERRIDE_VALID = 1;
+                    G_RC_OVERRIDE_TICK = app_ticks();
+                }
+                info!(tag: "uplink", "RC_OVERRIDE ch1={} ch2={} -> valid", ch[0], ch[1]);
+            }
+        }
         _ => {
             // 其余消息（HEARTBEAT/ATTITUDE 等上行）第一版忽略
         }
@@ -356,6 +423,89 @@ fn find_param(id: &[u8; 16]) -> Option<usize> {
         }
     }
     None
+}
+
+// ── 航点（MISSION）握手处理函数 ─────────────────────────────────────
+/// MISSION 下载：地面站请求全部航点 -> 回 MISSION_COUNT + 逐个 MISSION_ITEM_INT + MISSION_ACK。
+fn mission_handle_request_list(dev: &Device) {
+    let count = unsafe { G_MISSION_COUNT };
+    let mut out = [0u8; ML_MAX];
+    let n = mavlink::encode_mission_count(count, &mut out);
+    let _ = send_frame(dev, &out, n);
+    for seq in 0..count {
+        let item = unsafe { G_MISSION[seq as usize] };
+        let n = mavlink::encode_mission_item_int(&item, &mut out);
+        let _ = send_frame(dev, &out, n);
+    }
+    let n = mavlink::encode_mission_ack(0, &mut out); // ACCEPTED
+    let _ = send_frame(dev, &out, n);
+    info!(tag: "uplink", "MISSION_REQUEST_LIST -> download {} items", count);
+}
+
+/// MISSION 上传开始：地面站宣布总数 -> 进入接收态并请求第 0 条。
+fn mission_handle_count(dev: &Device, count: u16) {
+    if count as usize > MISSION_MAX {
+        let mut out = [0u8; ML_MAX];
+        let n = mavlink::encode_mission_ack(4, &mut out); // NO_SPACE
+        let _ = send_frame(dev, &out, n);
+        return;
+    }
+    unsafe {
+        G_MISSION_RCV_STATE = RCV_WAIT_ITEM;
+        G_MISSION_RCV_NEXT = 0;
+        G_MISSION_RCV_TOTAL = count;
+    }
+    let mut out = [0u8; ML_MAX];
+    let n = mavlink::encode_mission_request(0, &mut out);
+    let _ = send_frame(dev, &out, n);
+    info!(tag: "uplink", "MISSION_COUNT={} -> requesting seq 0", count);
+}
+
+/// MISSION 上传：收到单条航点 -> 存储 + 请求下一条或结束握手。
+fn mission_handle_item(dev: &Device, item: &mavlink::MissionItem) {
+    let (state, next, total) = unsafe { (G_MISSION_RCV_STATE, G_MISSION_RCV_NEXT, G_MISSION_RCV_TOTAL) };
+    if state != RCV_WAIT_ITEM {
+        return;
+    }
+    if item.seq != next {
+        // 序号不符：回 INVALID_SEQUENCE，要求重发当前 next
+        let mut out = [0u8; ML_MAX];
+        let n = mavlink::encode_mission_ack(5, &mut out); // INVALID_SEQUENCE
+        let _ = send_frame(dev, &out, n);
+        info!(tag: "uplink", "MISSION item seq={} != expected {} -> INVALID_SEQUENCE", item.seq, next);
+        return;
+    }
+    unsafe {
+        G_MISSION[item.seq as usize] = *item;
+    }
+    let next2 = next + 1;
+    if next2 >= total {
+        unsafe {
+            G_MISSION_COUNT = total;
+            G_MISSION_RCV_STATE = RCV_IDLE;
+            G_MISSION_RCV_NEXT = 0;
+        }
+        let mut out = [0u8; ML_MAX];
+        let n = mavlink::encode_mission_ack(0, &mut out); // ACCEPTED
+        let _ = send_frame(dev, &out, n);
+        info!(tag: "uplink", "MISSION upload complete: {} items", total);
+    } else {
+        unsafe { G_MISSION_RCV_NEXT = next2; }
+        let mut out = [0u8; ML_MAX];
+        let n = mavlink::encode_mission_request(next2, &mut out);
+        let _ = send_frame(dev, &out, n);
+        info!(tag: "uplink", "MISSION item seq={} stored, requesting seq={}", item.seq, next2);
+    }
+}
+
+/// 读取 RC_OVERRIDE（control 任务调用）：返回 (ch[8], valid)。
+/// 超过 2s 未刷新视为失效，control 应回退到 sim RC。
+pub fn get_rc_override() -> ([u16; 8], bool) {
+    unsafe {
+        let valid = G_RC_OVERRIDE_VALID != 0
+            && (app_ticks().wrapping_sub(G_RC_OVERRIDE_TICK) < 200);
+        (G_RC_OVERRIDE, valid)
+    }
 }
 
 fn handle_param_set(dev: &Device, seq: &mut u8, ps: mavlink::ParamSet) {
@@ -444,6 +594,7 @@ pub extern "C" fn uplink_task(_arg: *mut c_void) {
 
         // 低频存活日志（约每 10s 一次），用于联调确认 uplink 任务未卡死。
         loops += 1;
+        unsafe { G_APP_TICKS = G_APP_TICKS.wrapping_add(1); }
         if loops % 1000 == 0 {
             info!(tag: "uplink", "poll alive loop={}", loops);
         }
