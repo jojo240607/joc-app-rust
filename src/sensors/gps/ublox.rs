@@ -312,7 +312,7 @@ impl GpsSensor for GpsUblox {
         let n = d_lat * R_EARTH;
         let e = d_lon * R_EARTH * libm::cosf(ref_lat * DEG2RAD);
         let d = -(alt - ref_alt); // 向下为正
-        Some(PosSample { pos: [Meter(n), Meter(e), Meter(d)] })
+        Some(PosSample::pos_only([Meter(n), Meter(e), Meter(d)]))
     }
 
     fn healthy(&self) -> bool {

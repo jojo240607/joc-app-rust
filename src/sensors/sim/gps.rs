@@ -29,13 +29,11 @@ impl GpsSensor for VirtualGps {
         // 相对起点的局部 NED（米）：经纬度差 × 米/度近似。
         let north = (lat - GPS_ORIGIN.0) * METERS_PER_DEG_LAT;
         let east = (lon - GPS_ORIGIN.1) * METERS_PER_DEG_LON;
-        Some(PosSample {
-            pos: [
-                Meter(north),
-                Meter(east),
-                Meter(-alt), // NED：高度向上为负 z
-            ],
-        })
+        Some(PosSample::pos_only([
+            Meter(north),
+            Meter(east),
+            Meter(-alt), // NED：高度向上为负 z
+        ]))
     }
 
     fn healthy(&self) -> bool {

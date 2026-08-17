@@ -257,16 +257,19 @@ pub extern "C" fn log_task_entry(_arg: *mut c_void) {
             };
             // entry[0]=len, entry[1]=level, entry[2..]= "R/L ticks tag: msg\n"
             // ring_pop 写入 n=entry_len=first+1 字节（first=len 字段，含 level+payload），
-            // 故 payload(去 len 头) = entry[1..e_len]。
+            // 故 ring 条目布局为 [len头=e_len][level][payload(含 \n)]，条目总长 = e_len+1。
+            // 真实 [level][payload] 落在 entry[1 .. e_len+1]。旧代码用 &entry[1..e_len]
+            // 会少取最后 1 字节 —— 正好是 emit 写入的 \n —— 导致所有 App 日志无换行、
+            // 在串口端串成一行。修正为 &entry[1..e_len+1] 包含 \n。
             let e_len = entry[0] as usize;
-            // 防御：len 字段非法（0 或超过 entry 缓冲长度 entry.len()=256）时，丢弃该
-            // 坏条目，绝不 panic 挂死 log_task / 整个 App。len=0 时 &entry[1..0] 会
-            // slice_index_fail panic（曾因此导致 App 挂死）。正常 e_len ≤ 181（emit
-            // 用 buf[180]），故 >256 或 ==0 必是 ring 数据异常。
-            if e_len == 0 || e_len > entry.len() {
+            // 防御：len 字段非法（0 或 e_len+1 越出 entry 缓冲长度 entry.len()=256）时，
+            // 丢弃该坏条目，绝不 panic 挂死 log_task / 整个 App。len=0 时 &entry[1..0]
+            // 会 slice_index_fail panic（曾因此导致 App 挂死）。正常 e_len ≤ 181（emit
+            // 用 buf[180]），故 e_len+1 > 256 或 ==0 必是 ring 数据异常。
+            if e_len == 0 || e_len + 1 > entry.len() {
                 break; // 坏条目，丢弃并退出本批（ring 数据异常，不再继续）
             }
-            let payload = &entry[1..e_len]; // 去掉 len 头，保留 level+payload
+            let payload = &entry[1..e_len + 1]; // 去掉 len 头，保留 level+payload(含 \n)
 
             // 尝试把这条 payload 拼入 pkt；遇到 `\n` 转 `\r\n`。
             let mut i = 0usize;
