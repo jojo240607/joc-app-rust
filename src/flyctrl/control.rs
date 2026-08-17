@@ -125,7 +125,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         };
 
         // --- 状态估计（EKF；GPS 位置测量可选） ---
-        let est: VehicleState = ekf.step(dt, imu_sample, gps, None);
+        let est: VehicleState = ekf.step(dt, imu_sample, gps, None, None);
 
         // --- FDIR 监控（四源可用性；mag 暂用 false，待 I2C 修复后接 sensors 帧） ---
         let mag_ok = false; // TODO: 接 SENSOR_FRAME.mag_ok（待 joc-base I2C 修复）
@@ -207,11 +207,11 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             first = false;
             info!(tag: "ctrl",
                   "first loop done; imu_ok={} armed={} crit={} alt={:.2}",
-                  imu.is_some(), armed, fdir.critical(), est.pos[2].0);
+                  imu.is_some(), armed_eff, fdir.critical(), est.pos[2].0);
         }
         if seq % 250 == 0 {
             info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} baro={} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
-                  seq, armed, fdir.critical(), est.pos[2].0,
+                  seq, armed_eff, fdir.critical(), est.pos[2].0,
                   imu.is_some(), gps.is_some(), baro_alt.is_some(), est.vel[2].0,
                   cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
         }
