@@ -22,6 +22,14 @@ use flyctrl_core::comm::link::{Frame, MAX_FRAME_LEN, MAX_FRAME_LEN as ML_MAX};
 use flyctrl_core::comm::mavlink::{self, enums, CommandLong, MAVLINK_MAGIC};
 use crate::abi::RTOS_PRIO_MAIN;
 
+// HIL：注入仿真真值到 SENSOR_FRAME 所需类型（本任务为 usb0 唯一读者，承担真值写入）。
+#[cfg(feature = "hil")]
+use crate::flyctrl::{SENSOR_FRAME, SENSOR_SEQ};
+#[cfg(feature = "hil")]
+use flyctrl_core::comm::mavlink::SetPositionTargetLocalNed;
+#[cfg(feature = "hil")]
+use flyctrl_core::vehicle::{ImuSample, PosSample, RcInput};
+
 // ── 全局共享状态（uplink -> control / telemetry） ──────────────────────
 /// 指令解锁位：地面站经 COMMAND_LONG(ARM/DISARM) 置位；control 任务用 `rc_armed || G_CMD_ARMED`。
 pub static G_CMD_ARMED: AtomicBool = AtomicBool::new(false);
@@ -36,6 +44,94 @@ pub static G_PARAM_TX_IDX: AtomicU16 = AtomicU16::new(0);
 pub static G_PARAM_REQ: AtomicBool = AtomicBool::new(false);
 /// 地面站请求自驾仪能力（COMMAND_LONG REQUEST_AUTOPILOT_CAPABILITIES）。
 pub static G_CAP_REQ: AtomicBool = AtomicBool::new(false);
+
+// ── HIL（硬件在环）共享状态 ─────────────────────────────────────────
+// 说明：HIL 模式下 usb0 的【唯一读者】是本任务（sensors_task 的采样路径被
+// `cfg(not(feature="hil"))` 关掉），因此仿真真值（HIL_SENSOR）与设定点
+// （SET_POSITION_TARGET_LOCAL_NED）都在本任务解析，再写入 SENSOR_FRAME
+// （seqlock 单写者不变式保持不变）与 G_HIL_SETPOINT。control/telemetry 只读。
+
+/// HIL：最近一帧 PC 设定点（SET_POSITION_TARGET_LOCAL_NED 解码结果）。
+/// 首个设定点到达前为全零；`G_HIL_SETPOINT_VALID` 标记是否已收到。
+#[cfg(feature = "hil")]
+#[link_section = ".rust_bss"]
+static mut G_HIL_SETPOINT: SetPositionTargetLocalNed = SetPositionTargetLocalNed {
+    time_boot_ms: 0, type_mask: 0,
+    x: 0.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0,
+    afx: 0.0, afy: 0.0, afz: 0.0, yaw: 0.0, yaw_rate: 0.0,
+};
+/// HIL：是否已收到首个 PC 设定点（sim 连接信号）。
+#[cfg(feature = "hil")]
+static mut G_HIL_SETPOINT_VALID: bool = false;
+
+/// HIL 真值累积器（HIL_SENSOR 与 SET_POSITION 分帧到达，先各自暂存，
+/// 再统一写 SENSOR_FRAME，避免某一帧缺失时把另一帧的真值清空）。
+#[cfg(feature = "hil")]
+#[link_section = ".rust_bss"]
+static mut G_HIL_IMU: Option<ImuSample> = None;
+#[cfg(feature = "hil")]
+#[link_section = ".rust_bss"]
+static mut G_HIL_BARO: Option<f32> = None;
+#[cfg(feature = "hil")]
+#[link_section = ".rust_bss"]
+static mut G_HIL_GPS: Option<PosSample> = None;
+
+/// HIL：最近一帧执行器指令（motor[0..4] 归一化推力）。control 每周期写、telemetry 回传。
+#[cfg(feature = "hil")]
+#[link_section = ".rust_bss"]
+static mut G_ACTUATOR_CMD: [f32; 4] = [0.0; 4];
+
+/// HIL：control 任务写入执行器指令（供 telemetry 回传 HIL_ACTUATOR_CONTROLS）。
+#[cfg(feature = "hil")]
+pub fn set_actuator_cmd(cmd: &[f32; 4]) {
+    unsafe { *core::ptr::addr_of_mut!(G_ACTUATOR_CMD) = *cmd; }
+}
+
+/// HIL：读取最近一帧执行器指令。
+#[cfg(feature = "hil")]
+pub fn actuator_cmd() -> [f32; 4] {
+    unsafe { *core::ptr::addr_of!(G_ACTUATOR_CMD) }
+}
+
+/// HIL：读取最近一帧 PC 设定点（control 任务生成 Setpoint 用）。
+#[cfg(feature = "hil")]
+pub fn hil_setpoint() -> SetPositionTargetLocalNed {
+    unsafe { *core::ptr::addr_of!(G_HIL_SETPOINT) }
+}
+
+/// HIL：是否已收到首个 PC 设定点（sim 连接信号）。
+#[cfg(feature = "hil")]
+pub fn hil_setpoint_valid() -> bool {
+    unsafe { G_HIL_SETPOINT_VALID }
+}
+
+/// HIL：HIL 模式遥控接收机不接；设定点来自 PC(SET_POSITION)，
+/// RC 仅需 `fresh=true` 使控制环输出（armed 由 COMMAND_LONG 指令置位）。
+#[cfg(feature = "hil")]
+fn rc_fresh() -> RcInput {
+    RcInput { roll: 0.0, pitch: 0.0, yaw: 0.0, throttle: 0.0, armed: false, mode: 0, fresh: true }
+}
+
+/// HIL：把累积的仿真真值整体写入 SENSOR_FRAME（seqlock，本任务为单写者）。
+#[cfg(feature = "hil")]
+fn hil_write_sensor_frame() {
+    let (imu, baro, gps) = unsafe { (G_HIL_IMU, G_HIL_BARO, G_HIL_GPS) };
+    let rc = rc_fresh();
+    unsafe {
+        SENSOR_SEQ = SENSOR_SEQ.wrapping_add(1); // 奇：写入中
+        let f = &mut *core::ptr::addr_of_mut!(SENSOR_FRAME);
+        f.imu = imu;
+        f.baro_alt = baro;
+        f.gps = gps;
+        f.rc = rc;
+        f.armed = rc.armed;
+        f.imu_ok = imu.is_some();
+        f.baro_ok = baro.is_some();
+        f.gps_ok = gps.is_some();
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        SENSOR_SEQ = SENSOR_SEQ.wrapping_add(1); // 偶：写入完成
+    }
+}
 
 // ── 航点（MISSION）存储 + 握手状态机全局 ─────────────────────────────
 /// 板载航点存储（固定数组，无堆）。最多 64 条航点（地面站常见任务规模足够）。
@@ -396,6 +492,41 @@ fn route_frame(dev: &Device, seq: &mut u8, msgid: u32, payload: &[u8]) {
                     G_RC_OVERRIDE_TICK = app_ticks();
                 }
                 info!(tag: "uplink", "RC_OVERRIDE ch1={} ch2={} -> valid", ch[0], ch[1]);
+            }
+        }
+        // ── HIL（硬件在环）：PC 仿真器注入传感器真值 + 设定点 ─────
+        #[cfg(feature = "hil")]
+        mavlink::msg_id::HIL_SENSOR => {
+            if let Some((_t, xacc, yacc, zacc, xgyro, ygyro, zgyro,
+                         _mx, _my, _mz, _ap, _dp, p_alt, _temp, _fu))
+                = mavlink::decode_hil_sensor(payload)
+            {
+                use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond};
+                let imu = ImuSample {
+                    accel: [MeterPerSecondSquared(xacc), MeterPerSecondSquared(yacc), MeterPerSecondSquared(zacc)],
+                    gyro: [RadianPerSecond(xgyro), RadianPerSecond(ygyro), RadianPerSecond(zgyro)],
+                };
+                unsafe { G_HIL_IMU = Some(imu); G_HIL_BARO = Some(p_alt); }
+                hil_write_sensor_frame();
+                info!(tag: "uplink", "HIL_SENSOR accel=({:.2},{:.2},{:.2}) gyro=({:.2},{:.2},{:.2}) alt={:.2}",
+                      xacc, yacc, zacc, xgyro, ygyro, zgyro, p_alt);
+            }
+        }
+        #[cfg(feature = "hil")]
+        mavlink::msg_id::SET_POSITION_TARGET_LOCAL_NED => {
+            if let Some(sp) = mavlink::decode_set_position_target_local_ned(payload) {
+                use flyctrl_core::units::{Meter, MeterPerSecond};
+                unsafe {
+                    *core::ptr::addr_of_mut!(G_HIL_SETPOINT) = sp;
+                    G_HIL_SETPOINT_VALID = true;
+                    G_HIL_GPS = Some(PosSample::with_vel(
+                        [Meter(sp.x), Meter(sp.y), Meter(sp.z)],
+                        [MeterPerSecond(sp.vx), MeterPerSecond(sp.vy), MeterPerSecond(sp.vz)],
+                    ));
+                }
+                hil_write_sensor_frame();
+                info!(tag: "uplink", "HIL_SETPOINT pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) yaw={:.2}",
+                      sp.x, sp.y, sp.z, sp.vx, sp.vy, sp.vz, sp.yaw);
             }
         }
         _ => {

@@ -38,6 +38,9 @@ CRC_EXTRA = {
     161: 68,   # FENCE_FETCH_POINT
     66: 148,    # REQUEST_DATA_STREAM
     67: 21,     # DATA_STREAM
+    84: 143,  # SET_POSITION_TARGET_LOCAL_NED  (标准 common.xml；与 mavlink-core frame.rs 一致)
+    93: 47,   # HIL_ACTUATOR_CONTROLS          (标准 common.xml)
+    107: 108, # HIL_SENSOR                     (标准 common.xml；勿信 DESIGN.md 笔误 90)
 }
 
 MAGIC = 0xFD
@@ -160,16 +163,101 @@ def enc_set_message_interval(msg_id, interval_us, seq):
     return enc_command_long(203, msg_id, interval_us, 0, 0, 0, 0, 0, seq)
 
 
+# ── HIL（硬件在环，仿真器 -> 飞控） ────────────────────────────────
+def enc_hil_sensor(time_usec, xacc, yacc, zacc, xgyro, ygyro, zgyro,
+                   xmag=0.0, ymag=0.0, zmag=0.0,
+                   abs_pressure=0.0, diff_pressure=0.0, pressure_alt=0.0,
+                   temperature=25, fields_updated=0, seq=0):
+    """HIL_SENSOR(107)：标准 62B。IMU/磁/气压真值，仿真器 -> 飞控。
+    约定：xacc/yacc/zacc 为机体系比力（悬停 zacc≈+9.81，NED 向下为正），
+    xgyro/ygyro/zgyro 为机体角速度(rad/s)，pressure_alt 为气压高度(m)。
+    """
+    p = bytearray(62)
+    p[0:8] = int(time_usec).to_bytes(8, 'little')
+    for i, v in enumerate([xacc, yacc, zacc, xgyro, ygyro, zgyro,
+                           xmag, ymag, zmag, abs_pressure, diff_pressure, pressure_alt]):
+        p[8 + i*4:12 + i*4] = f32(v)
+    p[56:58] = int(temperature).to_bytes(2, 'little', signed=True)
+    p[58:62] = int(fields_updated).to_bytes(4, 'little')
+    return frame(107, bytes(p), seq)
+
+def enc_set_position_target_local_ned(time_boot_ms, x, y, z, vx=0.0, vy=0.0, vz=0.0,
+                                      afx=0.0, afy=0.0, afz=0.0, yaw=0.0, yaw_rate=0.0,
+                                      type_mask=0, seq=0):
+    """SET_POSITION_TARGET_LOCAL_NED(84)：标准 51B，CRC_EXTRA=143。
+    坐标系 MAV_FRAME_LOCAL_NED(1)。HIL 场景下同时承载「期望状态」与
+    「机体位置真值」（MCU 端 G_HIL_GPS 取 x/y/z 作为位置测量）。
+    type_mask=0 表示位置/速度/加速度/偏航全部使用。
+    """
+    p = bytearray(51)
+    p[0:4] = int(time_boot_ms).to_bytes(4, 'little')
+    p[4] = 1  # MAV_FRAME_LOCAL_NED
+    p[5:7] = int(type_mask).to_bytes(2, 'little')
+    for i, v in enumerate([x, y, z, vx, vy, vz, afx, afy, afz, yaw, yaw_rate]):
+        p[7 + i*4:11 + i*4] = f32(v)
+    return frame(84, bytes(p), seq)
+
+def dec_hil_actuator_controls(payload):
+    """HIL_ACTUATOR_CONTROLS(93)：标准 81B，CRC_EXTRA=47。飞控 -> 仿真器。
+    返回 (time_usec, controls[16], mode, flags)。controls[0..4] 为四电机归一化推力。
+    """
+    if len(payload) < 81:
+        return None
+    import struct
+    time_usec = struct.unpack_from('<Q', payload, 0)[0]
+    controls = list(struct.unpack_from('<16f', payload, 8))
+    mode = payload[72]
+    flags = struct.unpack_from('<Q', payload, 73)[0]
+    return (time_usec, controls, mode, flags)
+
+def dec_local_position_ned(payload):
+    """LOCAL_POSITION_NED(32)：标准 28B，CRC_EXTRA=185。飞控 -> 地面站。
+    返回 (time_boot_ms, x, y, z, vx, vy, vz)。NED，单位 m / m/s。
+    """
+    if len(payload) < 28:
+        return None
+    import struct
+    return struct.unpack_from('<I3f3f', payload, 0)
+
+def dec_heartbeat(payload):
+    """HEARTBEAT(0)：标准 9B。返回 (custom_mode, type, autopilot, base_mode,
+    system_status, mavlink_version)。base_mode 含 MAV_MODE_FLAG_HIL_ENABLED(0x20) 表示 HIL。"""
+    if len(payload) < 9:
+        return None
+    import struct
+    mtype, autopilot, base_mode, custom_mode, sys_status, ver = struct.unpack_from('<BBBI2B', payload, 0)
+    return (custom_mode, mtype, autopilot, base_mode, sys_status, ver)
+
+
 def find_cdc():
-    """自动探测 ST VCP / CDC-ACM 端口（优先 VID_0483 / 5740）。"""
+    """自动探测 HIL 上行 USB-CDC 端口（STM32 CDC，VID_0483:PID_5740）。
+
+    边界：本工程 HIL 上行走 STM32 USB-CDC（如 COM12），日志走独立 UART
+    （CH340，如 COM8）。探测必须把两者分清，否则会拿到日志口而读不到 HIL 数据。
+    匹配策略按优先级：
+      1. 精确 PID 5740（STM32 USB CDC / ST VCP）——HIL 上行口；
+      2. 描述含 "Virtual COM Port" 的 STMicroelectronics 设备；
+      3. 兜底：任何 STMicroelectronics 设备。
+    返回首个命中端口的 device 名；未找到返回 None。
+    """
     try:
         import serial.tools.list_ports
     except Exception:
         return None
-    for p in serial.tools.list_ports.comports():
-        hwid = getattr(p, 'hwid', '') or ''
-        desc = p.description or ''
-        if '5740' in hwid or 'VID_0483' in hwid or 'STMicroelectronics' in desc:
+    cands = list(serial.tools.list_ports.comports())
+    for p in cands:
+        hwid = (getattr(p, 'hwid', '') or '').upper()
+        if '0483:5740' in hwid:
+            return p.device
+    for p in cands:
+        hwid = (getattr(p, 'hwid', '') or '').upper()
+        desc = (p.description or '').upper()
+        if 'STMicroelectronics' in desc and 'VIRTUAL COM' in desc:
+            return p.device
+    for p in cands:
+        hwid = (getattr(p, 'hwid', '') or '').upper()
+        desc = (p.description or '').upper()
+        if 'STMicroelectronics' in desc or '0483' in hwid:
             return p.device
     return None
 

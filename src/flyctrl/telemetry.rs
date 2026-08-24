@@ -81,7 +81,12 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
             // 是 SYS_STATUS 头 fd1f0000...）→ host 端只有 SS、无 HB/LP、每 seq 前缀
             // 重复 3 次、CRC 全错。改为每帧 encode 后立即 write，fb 在 write 前是
             // 正确的当前帧。
-            let n1 = mavlink::encode_heartbeat(mode, armed, seq, fb);
+            let n1 = {
+                #[cfg(feature = "hil")]
+                { mavlink::encode_heartbeat_hil(mode, armed, seq, fb) }
+                #[cfg(not(feature = "hil"))]
+                { mavlink::encode_heartbeat(mode, armed, seq, fb) }
+            };
             let k1 = d.write(&fb[..n1]);
             if k1 > 0 { total += k1; }
 
@@ -109,6 +114,22 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
         };
         if let Some(d) = usb_dev.as_ref() {
             wrote_usb = send(d, frame_buf, seq, &est, armed, health != Health::Critical, cmd_mode);
+        }
+
+        // HIL：回传执行器指令（HIL_ACTUATOR_CONTROLS(93)），PC 端仿真器据此驱动 plant。
+        // control 每周期把 motor[0..4] 写入 G_ACTUATOR_CMD，本处随心跳节奏一起下发。
+        #[cfg(feature = "hil")]
+        if let Some(d) = usb_dev.as_ref() {
+            use flyctrl_core::comm::mavlink::enums;
+            let motors = crate::flyctrl::uplink::actuator_cmd();
+            let mut controls = [0f32; 16];
+            controls[0..4].copy_from_slice(&motors);
+            let mode_bm = enums::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+                | enums::MAV_MODE_FLAG_HIL_ENABLED
+                | if armed { enums::MAV_MODE_FLAG_SAFETY_ARMED } else { 0 };
+            let nh = mavlink::encode_hil_actuator_controls(
+                (boot_ms as u64) * 1000, &controls, mode_bm, 0, seq, frame_buf);
+            let _ = d.write(&frame_buf[..nh]);
         }
 
         seq = seq.wrapping_add(1);

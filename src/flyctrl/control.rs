@@ -8,7 +8,9 @@ use core::ffi::c_void;
 use flyctrl_core::controller::{Controller, PidController, Setpoint};
 use flyctrl_core::estimator::{Estimator, EkfEstimator};
 use flyctrl_core::fdir::{Fdir, Health};
-use flyctrl_core::units::{Meter, MeterPerSecond, Radian, Second};
+use flyctrl_core::units::{Meter, MeterPerSecond, MeterPerSecondSquared, Second};
+#[cfg(not(feature = "hil"))]
+use flyctrl_core::units::Radian;
 use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, RcInput, VehicleState};
 
 use crate::abi::RTOS_PRIO_BH_HIGH;
@@ -74,22 +76,21 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         crate::flyctrl::uplink::sync_gains_to_pid(&mut pid);
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: loop enter"); }
 
-        // --- 取最新传感器帧（seqlock：control 优先级高于 sensors，读不被打断） ---
+        // --- 取最新传感器帧（seqlock：control 优先级高于所有写者，读不被打断） ---
+        // 写者：sensors(prio=5，非 HIL) / uplink(prio=10，HIL)。两者优先级均低于本任务
+        // (control, prio=4)，因此读过程不可能被写者抢占 → 单次读即原子一致，无需重试。
+        // 【关键】绝不能 `continue` 忙等重试：若赶上写者正处于写入中（SENSOR_SEQ 为奇，
+        // 写者被本任务抢占在置奇与置偶之间），忙等会让低优先级写者永远得不到调度，
+        // control 无限自旋 → 整机卡死（HIL 注入期间已实测复现：运行数秒后日志/下行全停）。
+        // 正确处理：直接采用本拍快照（可能新老混合/略旧），下一 4ms 拍自然取得一致新帧。
         let (mut imu, mut rc, mut gps, mut baro_alt, mut armed);
         unsafe {
-            let mut s1;
-            loop {
-                s1 = SENSOR_SEQ;
-                if s1 & 1 != 0 { continue; } // sensors 正在写，重试
-                let f = &*core::ptr::addr_of!(SENSOR_FRAME);
-                imu = f.imu;
-                rc = f.rc;
-                gps = f.gps;
-                baro_alt = f.baro_alt;
-                armed = f.armed;
-                let s2 = SENSOR_SEQ;
-                if s1 == s2 { break; } // 首尾一致，读取完整
-            }
+            let f = &*core::ptr::addr_of!(SENSOR_FRAME);
+            imu = f.imu;
+            rc = f.rc;
+            gps = f.gps;
+            baro_alt = f.baro_alt;
+            armed = f.armed;
         }
         // 指令解锁：与地面站上行命令做逻辑或（RC 解锁 或 指令解锁 任一为真）。
         let cmd_armed = crate::flyctrl::uplink::G_CMD_ARMED.load(Ordering::Relaxed);
@@ -142,20 +143,46 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
 
         // --- 期望状态：模式决定目标（原点定高 / RTL 回原点 / LAND 缓降） ---
         // custom_mode 用 ArduCopter 标准码（G_CMD_MODE 由上行 DO_SET_MODE/TAKEOFF/LAND/RTL 写入）。
-        let cmd_mode = crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed);
-        use flyctrl_core::comm::mavlink::enums::COPTER_MODE_LAND;
-        let thr_off = (rc.throttle - 0.5) * 2.0;
-        // 默认目标：锁定高度基准（原点）。LAND 模式触发持续缓降。
-        let mut target_alt = hold_alt.0 - thr_off * 2.0;
-        if cmd_mode == COPTER_MODE_LAND {
-            // LAND：在基准高度上每周期降 0.02m，趋向地面（D 向下，地面=0）。
-            target_alt = (est.pos[2].0 - 0.02).max(0.0);
-        }
-        // RTL/LOITER 水平目标已为原点（N=0,E=0）；STABILIZE 保持同样基准，确保联调可观测。
-        let setpoint = Setpoint {
-            pos: [Meter(0.0), Meter(0.0), Meter(target_alt)],
-            yaw: Radian(rc.yaw * 0.5),
-            vel: [MeterPerSecond(0.0); 3],
+        // HIL：设定点直接来自 PC 仿真器（SET_POSITION_TARGET_LOCAL_NED），RC 路径编译期关闭。
+        #[cfg(feature = "hil")]
+        let setpoint = {
+            use flyctrl_core::units::Radian;
+            let sp = crate::flyctrl::uplink::hil_setpoint();
+            if crate::flyctrl::uplink::hil_setpoint_valid() {
+                Setpoint {
+                    pos: [Meter(sp.x), Meter(sp.y), Meter(sp.z)],
+                    yaw: Radian(sp.yaw),
+                    vel: [MeterPerSecond(sp.vx), MeterPerSecond(sp.vy), MeterPerSecond(sp.vz)],
+                    acc: [MeterPerSecondSquared(sp.afx), MeterPerSecondSquared(sp.afy), MeterPerSecondSquared(sp.afz)],
+                }
+            } else {
+                // sim 尚未连接：保持当前位置定高，避免悬停指令冲击。
+                Setpoint {
+                    pos: [Meter(0.0), Meter(0.0), est.pos[2]],
+                    yaw: Radian(0.0),
+                    vel: [MeterPerSecond(0.0); 3],
+                    acc: [MeterPerSecondSquared(0.0); 3],
+                }
+            }
+        };
+        #[cfg(not(feature = "hil"))]
+        let setpoint = {
+            let cmd_mode = crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed);
+            use flyctrl_core::comm::mavlink::enums::COPTER_MODE_LAND;
+            let thr_off = (rc.throttle - 0.5) * 2.0;
+            // 默认目标：锁定高度基准（原点）。LAND 模式触发持续缓降。
+            let mut target_alt = hold_alt.0 - thr_off * 2.0;
+            if cmd_mode == COPTER_MODE_LAND {
+                // LAND：在基准高度上每周期降 0.02m，趋向地面（D 向下，地面=0）。
+                target_alt = (est.pos[2].0 - 0.02).max(0.0);
+            }
+            // RTL/LOITER 水平目标已为原点（N=0,E=0）；STABILIZE 保持同样基准，确保联调可观测。
+            Setpoint {
+                pos: [Meter(0.0), Meter(0.0), Meter(target_alt)],
+                yaw: Radian(rc.yaw * 0.5),
+                vel: [MeterPerSecond(0.0); 3],
+                acc: [MeterPerSecondSquared(0.0); 3],
+            }
         };
 
         // --- 控制律（armed 且链路健康才输出推力） ---
@@ -165,6 +192,11 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         } else {
             ActuatorCmd::zero()
         };
+
+        // HIL：回传执行器指令供 telemetry 组 HIL_ACTUATOR_CONTROLS（PC 端注入 plant）。
+        #[cfg(feature = "hil")]
+        crate::flyctrl::uplink::set_actuator_cmd(&cmd.motor);
+
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: pid ok"); }
 
         // --- 输出 PWM（4 路 ioctl 设占空比 ticks） ---

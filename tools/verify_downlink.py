@@ -21,6 +21,14 @@ import serial
 
 import mavlink as ml
 
+# 遥测帧 msgid：每 20ms 下行 6 帧(HB=0/LP=32/SS=1/ATTITUDE=30/VFR_HUD=74/
+# GLOBAL_POSITION_INT=33)共享同一 seq 计数器，逐周期 +1。
+# 序列连续性只对核心三路(HB/LP/SS=0/32/1)统计：它们最先写、被 USB 流控丢帧的
+# 概率最低；下行流里混入的上行应答帧(COMMAND_ACK=77 / PARAM_VALUE=22 /
+# AUTOPILOT_VERSION=300)是一次性插入，seq 无连续性，参与统计会造出假阳性
+# seq_jumps。任一路遥测连续即代表链路无字节污染。
+TELEMETRY_IDS = frozenset((0, 32, 1))
+
 
 def main():
     ap = argparse.ArgumentParser(description="USB CDC 下行 MAVLink v2 严格校验")
@@ -49,7 +57,10 @@ def main():
         if b:
             buf += b
             raw += len(b)
-        # 只在 buf[scan_pos:] 里滑动解析，每个 0xFD 尝试一帧；成功则前移 scan_pos。
+        # 只在 buf[scan_pos:] 里滑动解析，每个 0xFD 尝试一帧。
+        # 防级联错位：CRC 校验失败说明这个 0xFD 大概率是某帧 payload 里的数据字节、
+        # 不是真帧头，此时【只前移 1 字节】继续找，绝不能按伪帧长整段消费——
+        # 否则会把后续真帧头吞掉，产生一连串假 crc_bad + 假 seq_jumps。
         i = scan_pos
         n = len(buf)
         while i < n - 11:
@@ -57,9 +68,6 @@ def main():
                 i += 1
                 continue
             plen = buf[i + 1]
-            if plen > 255:
-                i += 1
-                continue
             total = 10 + plen + 2
             if i + total > n:
                 break                       # 帧未收齐，等更多数据
@@ -69,19 +77,23 @@ def main():
             c = ml.crc16(c, [ml.CRC_EXTRA.get(msgid, 0)])
             fc = buf[i + total - 2] | (buf[i + total - 1] << 8)
             crc_ok = (c == fc)
-            frames += 1
-            if crc_ok:
-                ok += 1
-            else:
+            if not crc_ok:
+                # 伪帧头：只跳过这个字节，继续向后找真帧头
                 bad += 1
+                i += 1
+                scan_pos = i
+                continue
+            frames += 1
+            ok += 1
             ids[msgid] = ids.get(msgid, 0) + 1
-            if crc_ok and msgid in seq_last:
-                delta = (seq - seq_last[msgid]) & 0xFF
-                if delta == 0:
-                    seq_dups += 1
-                elif delta != 1:
-                    seq_jumps += 1
-            if crc_ok:
+            # 序列连续性仅对核心遥测帧统计（非遥测帧是一次性插入，无连续性可言）
+            if msgid in TELEMETRY_IDS:
+                if msgid in seq_last:
+                    delta = (seq - seq_last[msgid]) & 0xFF
+                    if delta == 0:
+                        seq_dups += 1
+                    elif delta != 1:
+                        seq_jumps += 1
                 seq_last[msgid] = seq
             scan_pos = i + total            # 前进到本帧末尾，避免重复计数
             i += total

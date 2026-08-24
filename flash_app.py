@@ -35,6 +35,11 @@ def start_openocd():
         f.write("source [find interface/stlink.cfg]\n")
         f.write("transport select swd\n")
         f.write("source [find target/stm32f4x.cfg]\n")
+        # 连接阶段断言 SRST 硬件复位，在固件运行（可能屏蔽调试）前完成内核
+        # 巡检/halt；否则目标运行中普通 SWD 访问会报 "Examination failed"
+        # / "AP write error"，GDB 报 errno 10061。与 joc-base flash_once.py
+        # 验证过的写法一致。
+        f.write("reset_config srst_only connect_assert_srst\n")
         f.write(f"gdb_port {GDB_PORT}\n")
     p = subprocess.Popen(
         [OCD_BIN, "-s", OCD_SCR, "-f", cfg, "-l", os.path.join(BASE, "ocd_app.log")],
