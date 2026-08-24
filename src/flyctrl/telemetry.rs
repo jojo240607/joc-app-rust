@@ -15,7 +15,7 @@ use crate::device::Device;
 use crate::{info, warn};
 use crate::rtos_sync::msleep;
 use core::sync::atomic::Ordering;
-use crate::flyctrl::{EST_MTX, EST_STATE};
+use crate::flyctrl::{EST_MTX, EST_STATE, USB_TX_MTX};
 use crate::flyctrl::uplink::G_THROTTLE;
 
 /// 帧缓冲放在静态区（不占任务栈）。
@@ -113,6 +113,9 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
             total
         };
         if let Some(d) = usb_dev.as_ref() {
+            // usb0 与 uplink 共享：RTOS 侧 TX ring 写无锁（假设单生产者），
+            // 必须用 USB_TX_MTX 串行化，否则两任务写帧会在 ring 中交错损坏。
+            let _g = unsafe { USB_TX_MTX.guard() };
             wrote_usb = send(d, frame_buf, seq, &est, armed, health != Health::Critical, cmd_mode);
         }
 
@@ -120,6 +123,7 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
         // control 每周期把 motor[0..4] 写入 G_ACTUATOR_CMD，本处随心跳节奏一起下发。
         #[cfg(feature = "hil")]
         if let Some(d) = usb_dev.as_ref() {
+            let _g = unsafe { USB_TX_MTX.guard() };
             use flyctrl_core::comm::mavlink::enums;
             let motors = crate::flyctrl::uplink::actuator_cmd();
             let mut controls = [0f32; 16];

@@ -375,7 +375,10 @@ impl UplinkTx {
 }
 
 /// 非阻塞写出一帧；host 不连/无 IN-token 时 usb write 返回 0（丢帧），不阻塞。
+/// 与 telemetry 共享 usb0：RTOS 侧 TX ring 写无锁（假设单生产者），此处用
+/// USB_TX_MTX 串行化所有上行应答写，避免与下行遥测帧在 ring 中交错损坏。
 fn send_frame(dev: &Device, out: &[u8; ML_MAX], n: usize) -> i32 {
+    let _g = unsafe { crate::flyctrl::USB_TX_MTX.guard() };
     let r = dev.write(&out[..n]);
     if r <= 0 {
         info!(tag: "uplink", "send_frame FAILED n={} ret={}", n, r);

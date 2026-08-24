@@ -17,6 +17,7 @@
 //! 跨任务共享数据经 RTOS 互斥量（`crate::rtos_sync::Mutex`）保护：
 //!   - SENSOR_FRAME / SENSOR_SEQ：最新传感器样本（sensors 单写、control/monitor 读，seqlock 无锁）
 //!   - EST_STATE   / EST_MTX  ：最新估计状态 + 健康（control 写、telemetry/monitor 读）
+//!   - usb0 下行   / USB_TX_MTX：telemetry(12)/uplink(10) 双写者串行化（RTOS TX ring 无锁）
 //!
 //! 注意：mag(QMC5883L@0x0D) 当前读取会在单总线 I2C 事务中卡死（见 memory：joc-app-rust
 //! mag.read 卡死 bug），待 joc-base I2C 驱动修复前，sensors 任务对 mag 走「缺失降级」路径，
@@ -107,15 +108,23 @@ pub static mut EST_STATE: EstState = unsafe { core::mem::zeroed() };
 /// 它会触发 BusFault。故强制 `.rust_bss` + `zeroed()`（全零合法初值）。
 #[link_section = ".rust_bss"]
 pub static mut SENSOR_FRAME: SensorFrame = unsafe { core::mem::zeroed() };
-/// 共享帧顺序计数器（seqlock）：sensors 写前+1(奇)、写后+1(偶)；control 读时校验
-/// 首尾 seq 相等且为偶即一致。control(prio4) > sensors(prio5)，读过程不会被 sensors
-/// 抢占，故无需 retry 也能保证原子；seq 仅作可见性/健壮性护栏。
+/// 共享帧顺序计数器（seqlock 写标记）：sensors/uplink 写前 +1(奇)、写后 +1(偶)。
+/// 读者（control，prio4 高于所有写者）【不校验】 seq：单次读取即原子（读过程不会被
+/// 低优先级写者抢占），但可能读到"写者被抢占中途"的新老混合快照，下一拍自然恢复一致
+/// （此即 HIL 注入期间实测踩坑的根因：绝不能 `continue` 忙等重试，否则低优先级写者
+/// 饿死 → 整机卡死，详见 control.rs 读帧处注释）。seq 仅作可见性护栏（compiler_fence
+/// 的发布/获取锚点）。若未来出现优先级高于 control 的写者，此护栏会静默失效，需重审。
 /// 之所以不用 Mutex(二值信号量)：本 RTOS ABI 无真互斥量，二值信号量在 control(硬实时)
 /// 与 sensors(相邻更低优先级) 临界区被抢占的场景下争用不安全，会导致调度器损坏。
 #[link_section = ".rust_bss"]
 pub static mut SENSOR_SEQ: u32 = 0;
 #[link_section = ".rust_bss"]
 pub static mut EST_MTX: Mutex = Mutex::uninit();
+/// usb0 下行写互斥：telemetry(prio12) 与 uplink(prio10) 共用同一 usb0 TX ring，
+/// 而 RTOS 侧 `usb_stream_write`/`rb_write` 无锁（注释假设"caller task model 单生产者"），
+/// 两个写者并发会把 MAVLink 帧在 ring 中交错损坏。故 app 层用此互斥串行化所有 usb0 写。
+#[link_section = ".rust_bss"]
+pub static mut USB_TX_MTX: Mutex = Mutex::uninit();
 
 /* ===================== 任务栈 ===================== */
 
@@ -166,6 +175,10 @@ pub fn spawn_flyctrl() {
         EST_MTX.init(RTOS_PRIO_BH_HIGH);    // control(4)/telem(12)
         crate::info!(tag: "flyctrl", "EST_MTX init count={} (expect 1, 否则互斥未生效→telem 死等)",
                      EST_MTX.debug_count());
+        // usb0 写者仅 telem(12)/uplink(10)，最高持锁者 prio=10。
+        USB_TX_MTX.init(10);
+        crate::info!(tag: "flyctrl", "USB_TX_MTX init count={} (expect 1)",
+                     USB_TX_MTX.debug_count());
     }
 
     // 日志消费者任务（低优先，drain 日志 ring → uart0）。必须最先创建，确保后续
