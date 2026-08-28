@@ -10,7 +10,7 @@
 //! 任务优先级档位（见 `crate::abi`）：
 //!   - `control`   prio=4  硬实时(priv=1, RTOS_RT_HARD) 周期 4ms：取最新样本 → EKF → FDIR → PID → PWM
 //!   - `sensors`   prio=5  软实时(priv=1)              周期 2ms：采 IMU/RC/Baro/Mag/GPS → 写共享帧
-//!   - `uplink`    prio=10 (priv=1)                    轮询 10ms：usb0.read 增量解析 → 命令路由
+//!   - `uplink`    prio=10 (priv=1)                    轮询 1ms：usb0.read 增量解析 → 命令路由
 //!   - `telemetry` prio=12 (priv=1)                    周期 20ms：从最新估计发 MAVLink(标准)
 //!   - `monitor`   prio=14 (priv=1)                    周期 1000ms：心跳日志 + 看门狗
 //!
@@ -33,7 +33,7 @@ use flyctrl_core::fdir::Health;
 use flyctrl_core::units::{Meter, MeterPerSecond, RadianPerSecond};
 
 use crate::abi::RTOS_PRIO_BH_HIGH;
-use crate::rtos_sync::{spawn_rt, Mutex, RT_HARD, RT_NONE};
+use crate::rtos_sync::{spawn_rt, Mutex, Semaphore, RT_HARD, RT_NONE};
 
 /* ===================== 共享数据 ===================== */
 
@@ -126,9 +126,19 @@ pub static mut EST_MTX: Mutex = Mutex::uninit();
 #[link_section = ".rust_bss"]
 pub static mut USB_TX_MTX: Mutex = Mutex::uninit();
 
+/// HIL 事件信号量：事件驱动闭环的同步原语（一输入一输出、不依赖 control 自身时钟）。
+/// uplink 写完一帧 HIL_SENSOR 后 `give()`；control 阻塞 `wait()`，收到一帧执行一拍
+/// `step_hil`（与 SIL 的"每物理步一拍"推模式 1:1 对齐）。初值 0，仅 HIL 编译期存在。
+#[cfg(feature = "hil")]
+#[link_section = ".rust_bss"]
+pub static mut HIL_EVT: Semaphore = Semaphore::uninit();
+
 /* ===================== 任务栈 ===================== */
 
-const STACK_CTRL: usize = 3072; // 控制律含 EKF+PID（当前回放 gps=None，真实 GPS 路径需更多，待数据就绪时再加）
+const STACK_CTRL: usize = 8192; // 控制律含 EKF+PID：EKF step 各更新函数有 4x400B 局部矩阵（a/ap/apat/krkt=1.6KB）
+                               // + propagate 1.2KB + 对象本身与调用链，峰值实测 >3KB；3072 时栈溢出→返回地址
+                               // 被数据覆盖→UsageFault(UNDEFINSTR/INVSTATE)→USB EP0 失服→HIL 端口 SetCommState 超时。
+                               // 8KB 含 GPS 更新路径余量充足（APP_RAM 余 ~103KB）。
 const STACK_SENS: usize = 3584; // 采样含回放+帧拷贝：实测峰值 > 3072（原靠 monitor 缓冲垫着才不崩），提到 3584 自洽
 const STACK_TELEM: usize = 4096; // 遥测 encode 3 个 MAVLink 帧(heartbeat/local_pos/sys_status)栈使用大，1024 疑似栈溢出导致 telem 卡住不写 usb0，提到 4096
 const STACK_UPLINK: usize = 4096; // 上行 poll_read+feed+decode 栈使用大，实测 1024 栈溢出导致系统 fault，提到 4096
@@ -179,6 +189,13 @@ pub fn spawn_flyctrl() {
         USB_TX_MTX.init(10);
         crate::info!(tag: "flyctrl", "USB_TX_MTX init count={} (expect 1)",
                      USB_TX_MTX.debug_count());
+    }
+    // HIL 事件信号量：初值 0、上限 1。control 阻塞等待、uplink 注入后投递。
+    #[cfg(feature = "hil")]
+    unsafe {
+        HIL_EVT.init();
+        crate::info!(tag: "flyctrl", "HIL_EVT init count={} (expect 0, 事件驱动闭环)",
+                     HIL_EVT.debug_count());
     }
 
     // 日志消费者任务（低优先，drain 日志 ring → uart0）。必须最先创建，确保后续

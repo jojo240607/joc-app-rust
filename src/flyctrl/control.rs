@@ -5,9 +5,10 @@
 
 use core::ffi::c_void;
 
-use flyctrl_core::controller::{Controller, PidController, Setpoint};
-use flyctrl_core::estimator::{Estimator, EkfEstimator};
-use flyctrl_core::fdir::{Fdir, Health};
+use flyctrl_core::controller::{PidController, Setpoint};
+use flyctrl_core::estimator::EkfEstimator;
+use flyctrl_core::fdir::Health;
+use flyctrl_core::hil::{HilContext, SimImu};
 use flyctrl_core::units::{Meter, MeterPerSecond, MeterPerSecondSquared, Second};
 #[cfg(not(feature = "hil"))]
 use flyctrl_core::units::Radian;
@@ -17,14 +18,16 @@ use crate::abi::RTOS_PRIO_BH_HIGH;
 use crate::device::Device;
 use crate::ioctl;
 use crate::{info, warn};
+#[cfg(not(feature = "hil"))]
 use crate::rtos_sync::msleep;
 use core::sync::atomic::Ordering;
-use crate::sensors::SimImu;
 
 /// 诊断开关：开启后会在启动前几圈打印大量 dbg 行，极易压垮开机瞬间的
 /// 设备串口 TX 缓冲、导致同期的传感器任务日志被丢弃（误判传感器任务“死亡”）。
 /// 正常验证时关闭。
 const VERBOSE: bool = false;
+#[cfg(feature = "hil")]
+use crate::flyctrl::HIL_EVT;
 use crate::flyctrl::{make_name, EST_MTX, EST_STATE, SENSOR_FRAME, SENSOR_SEQ};
 
 /// 上行指令解锁：地面站经 COMMAND_LONG(ARM/DISARM) 设置。
@@ -43,12 +46,21 @@ pub fn set_cmd_mode(mode: u16) {
 pub extern "C" fn control_entry(_arg: *mut c_void) {
     info!(tag: "ctrl", "task started; period=4ms prio={}", RTOS_PRIO_BH_HIGH);
 
-    // 控制律对象（每周期复用，避免重复分配）。
-    let mut ekf = EkfEstimator::default_quad();
-    let mut fdir = Fdir::new();
-    let mut pid = PidController::default_quad();
+    // 控制律对象（共享单步：SIL/HIL 同一份编排，见 `flyctrl_core::hil::step_hil`）。
+    // 姿态/位置初始化门控、SimImu 回退、EKF + 气压观测、FDIR、控制环健康闸、
+    // 执行器限幅全部由 `step_hil` 完成，与 SIL（fly-sim-core）完全一致。
+    let mut hil = HilContext::new(
+        EkfEstimator::default_quad(),
+        PidController::default_quad(),
+        Second(4.0 / 1000.0),
+    );
+    // 共享单步回退 IMU（与 SIL 同源实现，保证注入饥饿时回退数据完全一致）。
+    let mut sim_imu = SimImu::new();
     let mut hold_alt = Meter(0.0);
     let mut alt_locked = false;
+    // 上一拍估计状态（供非 HIL 设定点高度基准 / HIL 链路未建立时定高；
+    // EKF 位置 4ms 内变化远小于 1mm，用上一拍等价）。
+    let mut last_est: Option<VehicleState> = None;
     let mut seq: u32 = 0;
 
     // PWM 设备（4 路，control 专用）
@@ -73,7 +85,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     loop {
         let dt = Second(4.0 / 1000.0);
         // 应用地面站参数（每周期原子读 G_PARAM_VALS -> pid 增益；PARAM_SET 即时生效）。
-        crate::flyctrl::uplink::sync_gains_to_pid(&mut pid);
+        crate::flyctrl::uplink::sync_gains_to_pid(&mut hil.ctrl);
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: loop enter"); }
 
         // --- 取最新传感器帧（seqlock：control 优先级高于所有写者，读不被打断） ---
@@ -85,12 +97,22 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // 正确处理：直接采用本拍快照（可能新老混合/略旧），下一 4ms 拍自然取得一致新帧。
         let (mut imu, mut rc, mut gps, mut baro_alt, mut armed);
         unsafe {
-            let f = &*core::ptr::addr_of!(SENSOR_FRAME);
+            let f = &mut *core::ptr::addr_of_mut!(SENSOR_FRAME);
             imu = f.imu;
             rc = f.rc;
             gps = f.gps;
             baro_alt = f.baro_alt;
             armed = f.armed;
+            // 【HIL 关键】IMU 单次消费：PC 每 ~32ms 才注入一帧 HIL_SENSOR，而本任务 4ms 一拍，
+            // 若读后不清空，同一陀螺样本会被连续积分 8 拍（重复积分同一角速度 → 姿态过积分发散）。
+            // 安全前提：control(prio=4) 高于所有写者(uplink prio=10 / sensors prio=5)，本拍读写之间
+            // 不可能被写者抢占，因此可就地清空、不会误清新注入帧；清空后下一拍无新 IMU 时，
+            // 自然回退 SimImu（零角速度 → 不漂移、不触发 FDIR 冻结误判）。
+            #[cfg(feature = "hil")]
+            {
+                f.imu = None;
+            }
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         // 指令解锁：与地面站上行命令做逻辑或（RC 解锁 或 指令解锁 任一为真）。
         let cmd_armed = crate::flyctrl::uplink::G_CMD_ARMED.load(Ordering::Relaxed);
@@ -119,18 +141,77 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             rc
         };
 
-        // IMU 缺失 → 模拟源（总线异常降级）
-        let imu_sample: ImuSample = match imu {
-            Some(s) => s,
-            None => SimImu::new().next(dt.0),
+        // --- 期望状态：模式决定目标（原点定高 / RTL 回原点 / LAND 缓降） ---
+        // custom_mode 用 ArduCopter 标准码（G_CMD_MODE 由上行 DO_SET_MODE/TAKEOFF/LAND/RTL 写入）。
+        // HIL：设定点直接来自 PC 仿真器（SET_POSITION_TARGET_LOCAL_NED），RC 路径编译期关闭。
+        // 设定点在共享单步**之前**构造：非 HIL 高度基准 / HIL 回退定高均用上一拍估计
+        // `last_est`（EKF 位置 4ms 内变化远小于 1mm，与"本拍估计后构造"等价）。
+        let (setpoint, setpoint_valid) = {
+            #[cfg(feature = "hil")]
+            {
+                use flyctrl_core::units::Radian;
+                let sp = crate::flyctrl::uplink::hil_setpoint();
+                if crate::flyctrl::uplink::hil_setpoint_valid() {
+                    (
+                        Setpoint {
+                            pos: [Meter(sp.x), Meter(sp.y), Meter(sp.z)],
+                            yaw: Radian(sp.yaw),
+                            vel: [MeterPerSecond(sp.vx), MeterPerSecond(sp.vy), MeterPerSecond(sp.vz)],
+                            acc: [MeterPerSecondSquared(sp.afx), MeterPerSecondSquared(sp.afy), MeterPerSecondSquared(sp.afz)],
+                        },
+                        true,
+                    )
+                } else {
+                    // sim 尚未连接：保持当前位置定高，避免悬停指令冲击。
+                    let hold_z = last_est.map(|e| e.pos[2].0).unwrap_or(0.0);
+                    (
+                        Setpoint {
+                            pos: [Meter(0.0), Meter(0.0), Meter(hold_z)],
+                            yaw: Radian(0.0),
+                            vel: [MeterPerSecond(0.0); 3],
+                            acc: [MeterPerSecondSquared(0.0); 3],
+                        },
+                        false,
+                    )
+                }
+            }
+            #[cfg(not(feature = "hil"))]
+            {
+                use flyctrl_core::units::Radian;
+                let cmd_mode = crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed);
+                use flyctrl_core::comm::mavlink::enums::COPTER_MODE_LAND;
+                let thr_off = (rc.throttle - 0.5) * 2.0;
+                // 默认目标：锁定高度基准（原点）。LAND 模式触发持续缓降。
+                let mut target_alt = hold_alt.0 - thr_off * 2.0;
+                if cmd_mode == COPTER_MODE_LAND {
+                    // LAND：在基准高度上每周期降 0.02m，趋向地面（D 向下，地面=0）。
+                    let cur_z = last_est.map(|e| e.pos[2].0).unwrap_or(hold_alt.0);
+                    target_alt = (cur_z - 0.02).max(0.0);
+                }
+                // RTL/LOITER 水平目标已为原点（N=0,E=0）；STABILIZE 保持同样基准，确保联调可观测。
+                (
+                    Setpoint {
+                        pos: [Meter(0.0), Meter(0.0), Meter(target_alt)],
+                        yaw: Radian(rc.yaw * 0.5),
+                        vel: [MeterPerSecond(0.0); 3],
+                        acc: [MeterPerSecondSquared(0.0); 3],
+                    },
+                    false,
+                )
+            }
         };
 
-        // --- 状态估计（EKF；GPS 位置测量可选） ---
-        let est: VehicleState = ekf.step(dt, imu_sample, gps, None);
-
-        // --- FDIR 监控（四源可用性；mag 暂用 false，待 I2C 修复后接 sensors 帧） ---
-        let mag_ok = false; // TODO: 接 SENSOR_FRAME.mag_ok（待 joc-base I2C 修复）
-        let health: Health = fdir.update(&imu_sample, gps.is_some(), baro_alt.is_some(), mag_ok);
+        // --- 共享单步（SIL/HIL 同一份编排，见 `flyctrl_core::hil::step_hil`） ---
+        // IMU 单次消费已在上方 SENSOR_FRAME 读取时完成（HIL 下 `f.imu = None`）；
+        // SimImu 回退、姿态/位置初始化门控、EKF 估计 + 气压观测、FDIR、控制环健康闸、
+        // 执行器限幅全部在 `step_hil` 内部完成，与 SIL（fly-sim-core）完全一致。
+        let r = hil.step_hil(
+            imu, gps, baro_alt, None, None, &setpoint, setpoint_valid, armed_eff, rc.fresh, &mut sim_imu,
+        );
+        let est = r.est;
+        let health = r.health;
+        let cmd = r.cmd;
+        last_est = Some(est);
 
         // 解锁瞬间锁定高度基准
         // [BISECT] armed_eff 已退化为 armed
@@ -140,58 +221,6 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         } else if !armed_eff {
             alt_locked = false;
         }
-
-        // --- 期望状态：模式决定目标（原点定高 / RTL 回原点 / LAND 缓降） ---
-        // custom_mode 用 ArduCopter 标准码（G_CMD_MODE 由上行 DO_SET_MODE/TAKEOFF/LAND/RTL 写入）。
-        // HIL：设定点直接来自 PC 仿真器（SET_POSITION_TARGET_LOCAL_NED），RC 路径编译期关闭。
-        #[cfg(feature = "hil")]
-        let setpoint = {
-            use flyctrl_core::units::Radian;
-            let sp = crate::flyctrl::uplink::hil_setpoint();
-            if crate::flyctrl::uplink::hil_setpoint_valid() {
-                Setpoint {
-                    pos: [Meter(sp.x), Meter(sp.y), Meter(sp.z)],
-                    yaw: Radian(sp.yaw),
-                    vel: [MeterPerSecond(sp.vx), MeterPerSecond(sp.vy), MeterPerSecond(sp.vz)],
-                    acc: [MeterPerSecondSquared(sp.afx), MeterPerSecondSquared(sp.afy), MeterPerSecondSquared(sp.afz)],
-                }
-            } else {
-                // sim 尚未连接：保持当前位置定高，避免悬停指令冲击。
-                Setpoint {
-                    pos: [Meter(0.0), Meter(0.0), est.pos[2]],
-                    yaw: Radian(0.0),
-                    vel: [MeterPerSecond(0.0); 3],
-                    acc: [MeterPerSecondSquared(0.0); 3],
-                }
-            }
-        };
-        #[cfg(not(feature = "hil"))]
-        let setpoint = {
-            let cmd_mode = crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed);
-            use flyctrl_core::comm::mavlink::enums::COPTER_MODE_LAND;
-            let thr_off = (rc.throttle - 0.5) * 2.0;
-            // 默认目标：锁定高度基准（原点）。LAND 模式触发持续缓降。
-            let mut target_alt = hold_alt.0 - thr_off * 2.0;
-            if cmd_mode == COPTER_MODE_LAND {
-                // LAND：在基准高度上每周期降 0.02m，趋向地面（D 向下，地面=0）。
-                target_alt = (est.pos[2].0 - 0.02).max(0.0);
-            }
-            // RTL/LOITER 水平目标已为原点（N=0,E=0）；STABILIZE 保持同样基准，确保联调可观测。
-            Setpoint {
-                pos: [Meter(0.0), Meter(0.0), Meter(target_alt)],
-                yaw: Radian(rc.yaw * 0.5),
-                vel: [MeterPerSecond(0.0); 3],
-                acc: [MeterPerSecondSquared(0.0); 3],
-            }
-        };
-
-        // --- 控制律（armed 且链路健康才输出推力） ---
-        // [BISECT] armed_eff 退化为 armed
-        let cmd = if armed_eff && rc.fresh && !fdir.critical() {
-            pid.control(dt, &setpoint, &est)
-        } else {
-            ActuatorCmd::zero()
-        };
 
         // HIL：回传执行器指令供 telemetry 组 HIL_ACTUATOR_CONTROLS（PC 端注入 plant）。
         #[cfg(feature = "hil")]
@@ -239,15 +268,35 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             first = false;
             info!(tag: "ctrl",
                   "first loop done; imu_ok={} armed={} crit={} alt={:.2}",
-                  imu.is_some(), armed_eff, fdir.critical(), est.pos[2].0);
+                  imu.is_some(), armed_eff, health == Health::Critical, est.pos[2].0);
+        }
+        if seq % 25 == 0 {
+            // [DIAG] EKF 状态演变诊断：每次 25 拍(≈100ms) 打印姿态/位置/速度/有限性，
+            // 定位 NaN 出现的时刻与当时的 EKF 状态（闭环发散排查用，定位后移除）。
+            let (r, p, y) = (est.att.roll(), est.att.pitch(), est.att.yaw());
+            let fin = est.att.w.is_finite() && est.att.x.is_finite()
+                && est.att.y.is_finite() && est.att.z.is_finite()
+                && est.pos.iter().all(|v| v.0.is_finite())
+                && est.vel.iter().all(|v| v.0.is_finite());
+            info!(tag: "ctrl", "dbg est r={:.1} p={:.1} y={:.1}deg p=({:.2},{:.2},{:.2}) v=({:.2},{:.2},{:.2}) fin={} imu_ok={}",
+                  r.to_degrees(), p.to_degrees(), y.to_degrees(),
+                  est.pos[0].0, est.pos[1].0, est.pos[2].0,
+                  est.vel[0].0, est.vel[1].0, est.vel[2].0, fin, imu.is_some());
         }
         if seq % 250 == 0 {
             info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} baro={} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
-                  seq, armed_eff, fdir.critical(), est.pos[2].0,
+                  seq, armed_eff, health == Health::Critical, est.pos[2].0,
                   imu.is_some(), gps.is_some(), baro_alt.is_some(), est.vel[2].0,
                   cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
         }
 
+        // 【HIL 事件驱动】不依赖 control 自身 4ms 时钟：阻塞等待下一帧 HIL_SENSOR
+        // 注入（uplink 写完真值即 `give()`），收到一帧执行一拍 `step_hil`——与 SIL
+        // 的"每物理步一拍、读最新样本"推模式 1:1 对齐，消除双时钟失配导致的输入流
+        // 差异（93.2% 控制拍缺 IMU 回退陈旧数据 → 姿态发散）。非 HIL 保持 4ms 周期轮询。
+        #[cfg(feature = "hil")]
+        unsafe { HIL_EVT.wait(); }
+        #[cfg(not(feature = "hil"))]
         msleep(4);
         if VERBOSE && seq < 5 {
             info!(tag: "ctrl", "dbg: after sleep seq={}", seq);

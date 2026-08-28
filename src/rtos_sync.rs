@@ -101,6 +101,71 @@ impl<'a> Drop for MutexGuard<'a> {
     }
 }
 
+/// 事件信号量（计数初值 0、上限 1），用于事件驱动闭环（HIL）。
+///
+/// 与 [`Mutex`]（初值 1、当互斥用）相对：本信号量初值 0，
+/// `wait()` 在计数为 0 时阻塞，`give()` 置 1 唤醒恰好一个等待者
+/// （计数已为 1 时 give 为 no-op，天然合并密集事件 → 与 SIL 的
+/// "每拍取最新样本"推模式语义一致）。HIL 下 uplink 写完一帧
+/// HIL_SENSOR 后 `give()`，control 阻塞 `wait()`——收到一帧执行一拍
+/// `step_hil`，严格一输入一输出、不依赖自身 4ms 时钟。
+pub struct Semaphore {
+    sem: rtos_sem_t,
+}
+
+// rtos_sem_t 含裸指针，Rust 视为 !Sync/!Send；RTOS 单核多任务下手工保证
+// 只通过地址访问，语义与 Mutex 相同，故显式标注。
+unsafe impl Sync for Semaphore {}
+unsafe impl Send for Semaphore {}
+
+impl Semaphore {
+    /// 编译期零初始化的未初始化信号量；必须先 `init()` 才能使用。
+    pub const fn uninit() -> Self {
+        Semaphore {
+            sem: rtos_sem_t {
+                count: 0,
+                limit: 0,
+                waitq: null_mut(),
+            },
+        }
+    }
+
+    /// 运行时初始化（只调一次）：计数初值 0、上限 1。与 [`Mutex::init`] 同，
+    /// 只做 `*const → *mut` 指针转换（不创建 Rust 的 `&mut`），规避 static mut 别名 UB。
+    pub fn init(&self) {
+        unsafe {
+            if let Some(f) = (*addr_of!(g_app_slot)).sem_init {
+                f(&self.sem as *const rtos_sem_t as *mut rtos_sem_t, 0, 1);
+            }
+        }
+    }
+
+    /// 阻塞等待事件（计数 0→1 即返回并清零；1→0）。
+    #[inline]
+    pub fn wait(&self) {
+        unsafe {
+            if let Some(f) = (*addr_of!(g_app_slot)).sem_wait {
+                f(&self.sem as *const rtos_sem_t as *mut rtos_sem_t);
+            }
+        }
+    }
+
+    /// 投递事件（0→1；已为 1 则 no-op，密集事件合并）。
+    #[inline]
+    pub fn give(&self) {
+        unsafe {
+            if let Some(f) = (*addr_of!(g_app_slot)).sem_give {
+                f(&self.sem as *const rtos_sem_t as *mut rtos_sem_t);
+            }
+        }
+    }
+
+    /// 诊断：返回当前计数（确认 init 生效）。
+    pub fn debug_count(&self) -> u32 {
+        unsafe { (*addr_of!(self.sem)).count }
+    }
+}
+
 /// 经 g_app_slot 的 RTOS msleep（SysTick 1000Hz 驱动调度）。
 #[inline]
 pub fn msleep(ms: u32) {

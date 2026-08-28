@@ -1,4 +1,4 @@
-﻿<#
+﻿﻿﻿﻿<#
 .SYNOPSIS
   P3-D2 真机联调 Phase 0 环境自检（COM12 通信 / COM8 调试 / ST-Link SWD 烧录）。
 

@@ -2,7 +2,10 @@
 //!
 //! 设计要点（与下行 telemetry 对称、无堆、非阻塞）：
 //! - `usb_dev.read` 是**非阻塞**的：RX ring 空时立即返回 0，不阻塞任务；
-//!   因此 uplink 任务用轮询循环 + `msleep(10)` 让出 CPU，绝不 busy-yield。
+//!   因此 uplink 任务用轮询循环 + `msleep(1)` 让出 CPU，绝不 busy-yield。
+//!   HIL 下 PC 每 4ms 注入一帧（74B），1ms 轮询保证 RX ring（256B）不被积满、
+//!   bulk-OUT 端点随时可 re-arm，避免 PC 端 USB 写阻塞拖慢注入节奏（实测 10ms
+//!   轮询时每 64B 块阻塞 ~3ms → 5.1x 仿真慢放）。
 //! - 增量解析器 `FxParser` 单字节状态机，跨多次 read 拼出完整 MAVLink v2 帧，
 //!   解决 USB-CDC 分包/粘包（一次 read 可能含半帧、多帧、或错位字节）。
 //! - 路由层只处理三类上行消息：COMMAND_LONG（解锁/SET_MODE/请求能力）、
@@ -24,7 +27,7 @@ use crate::abi::RTOS_PRIO_MAIN;
 
 // HIL：注入仿真真值到 SENSOR_FRAME 所需类型（本任务为 usb0 唯一读者，承担真值写入）。
 #[cfg(feature = "hil")]
-use crate::flyctrl::{SENSOR_FRAME, SENSOR_SEQ};
+use crate::flyctrl::{HIL_EVT, SENSOR_FRAME, SENSOR_SEQ};
 #[cfg(feature = "hil")]
 use flyctrl_core::comm::mavlink::SetPositionTargetLocalNed;
 #[cfg(feature = "hil")]
@@ -113,24 +116,33 @@ fn rc_fresh() -> RcInput {
 }
 
 /// HIL：把累积的仿真真值整体写入 SENSOR_FRAME（seqlock，本任务为单写者）。
+/// - `take()`：每类真值只投递一次。HIL_SENSOR / SET_POSITION 分帧到达，写入即清空累积器，
+///   避免下一帧把过期的 IMU/气压/GPS 再次搬入 SENSOR_FRAME。
+/// - 合并写入：只覆盖本拍新到的字段，`None` 不清已有真值。这样紧随 HIL_SENSOR 之后的
+///   SET_POSITION 帧不会把刚写入的 IMU 覆盖成 None（IMU 是否单次消费由 control 任务负责）。
 #[cfg(feature = "hil")]
 fn hil_write_sensor_frame() {
-    let (imu, baro, gps) = unsafe { (G_HIL_IMU, G_HIL_BARO, G_HIL_GPS) };
+    let (imu, baro, gps) = unsafe { (G_HIL_IMU.take(), G_HIL_BARO.take(), G_HIL_GPS.take()) };
     let rc = rc_fresh();
     unsafe {
         SENSOR_SEQ = SENSOR_SEQ.wrapping_add(1); // 奇：写入中
         let f = &mut *core::ptr::addr_of_mut!(SENSOR_FRAME);
-        f.imu = imu;
-        f.baro_alt = baro;
-        f.gps = gps;
+        if let Some(v) = imu { f.imu = Some(v); }
+        if let Some(v) = baro { f.baro_alt = Some(v); }
+        if let Some(v) = gps { f.gps = Some(v); }
         f.rc = rc;
         f.armed = rc.armed;
-        f.imu_ok = imu.is_some();
-        f.baro_ok = baro.is_some();
-        f.gps_ok = gps.is_some();
+        f.imu_ok = f.imu.is_some();
+        f.baro_ok = f.baro_alt.is_some();
+        f.gps_ok = f.gps.is_some();
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         SENSOR_SEQ = SENSOR_SEQ.wrapping_add(1); // 偶：写入完成
     }
+    // 【HIL 事件驱动】通知 control：新一帧真值已就绪。二进制信号量计数上限 1、
+    // give 已为 1 时 no-op → 同一物理步的 HIL_SENSOR/GPS/SET_POSITION 多帧连续到达时
+    // 合并为一次唤醒（与 SIL "每拍取最新样本"推模式一致）；control 阻塞 `wait()` 直到
+    // 此 give，实现一输入一输出闭环、不依赖自身 4ms 时钟。
+    unsafe { HIL_EVT.give(); }
 }
 
 // ── 航点（MISSION）存储 + 握手状态机全局 ─────────────────────────────
@@ -301,21 +313,23 @@ const PARAM_NAMES: &[[u8; 16]] = &[
 const PARAM_MIN: [f32; 5] = [0.0, 0.0, 0.0, 0.0, 0.1];
 const PARAM_MAX: [f32; 5] = [5.0, 5.0, 5.0, 5.0, 1.0];
 
-/// 参数值表（可读写，地面站 PARAM_SET 写入；初始值与 `PidController::default_quad` 对齐）。
+/// 参数值表（可读写，地面站 PARAM_SET 写入；初始值与 SIL 侧 `PidController::from_config`
+/// 派生结果对齐——即 `VehicleConfig::default_quad().ctrl_params()`：kp_xy=0.3、kv_xy=0.8、
+/// kv_z 保留 default_quad 基值 1.5、kp_z=0.5、hover_thrust=0.5）。
 /// control 任务每周期原子读此表并应用到 pid 增益，使参数设置真正生效。
 ///
 /// 注意：此表被强制进 `.rust_bss`（见 link_section），而系统区加载器只清零 APP_RAM、
 /// 不拷贝 `.app_data` 初值——Rust 运行时也不会为 `.bss` 重填非零初值。因此源码里的
-/// `[0.5,0.5,0.8,0.8,0.5]` 初值会被丢弃、运行期全 0。必须在 `init_param_defaults()`
+/// `[0.3,0.5,0.8,1.5,0.5]` 初值会被丢弃、运行期全 0。必须在 `init_param_defaults()`
 /// 里显式写入（与 mod.rs 里 EST_STATE 的运行时填充同款手法）。
 #[link_section = ".rust_bss"]
-static mut G_PARAM_VALS: [f32; 5] = [0.5, 0.5, 0.8, 0.8, 0.5];
+static mut G_PARAM_VALS: [f32; 5] = [0.3, 0.5, 0.8, 1.5, 0.5];
 
 /// 运行时填充 G_PARAM_VALS 初始值（`.rust_bss` 初值被加载器清零，必须显式写）。
 /// 由 spawn_flyctrl 在任务创建前调用一次。
 pub fn init_param_defaults() {
     unsafe {
-        *core::ptr::addr_of_mut!(G_PARAM_VALS) = [0.5, 0.5, 0.8, 0.8, 0.5];
+        *core::ptr::addr_of_mut!(G_PARAM_VALS) = [0.3, 0.5, 0.8, 1.5, 0.5];
     }
 }
 
@@ -518,18 +532,35 @@ fn route_frame(dev: &Device, seq: &mut u8, msgid: u32, payload: &[u8]) {
         #[cfg(feature = "hil")]
         mavlink::msg_id::SET_POSITION_TARGET_LOCAL_NED => {
             if let Some(sp) = mavlink::decode_set_position_target_local_ned(payload) {
-                use flyctrl_core::units::{Meter, MeterPerSecond};
                 unsafe {
                     *core::ptr::addr_of_mut!(G_HIL_SETPOINT) = sp;
                     G_HIL_SETPOINT_VALID = true;
-                    G_HIL_GPS = Some(PosSample::with_vel(
-                        [Meter(sp.x), Meter(sp.y), Meter(sp.z)],
-                        [MeterPerSecond(sp.vx), MeterPerSecond(sp.vy), MeterPerSecond(sp.vz)],
-                    ));
+                    // 注意：本消息【只作设定点】。GPS 位置/速度真值改由独立的
+                    // HIL_GPS(113) 分支注入（G_HIL_GPS），避免真值被固定为设定点
+                    // 导致 EKF 无法跟踪真实位置/速度（见 HIL_GPS 分支注释）。
                 }
                 hil_write_sensor_frame();
                 info!(tag: "uplink", "HIL_SETPOINT pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) yaw={:.2}",
                       sp.x, sp.y, sp.z, sp.vx, sp.vy, sp.vz, sp.yaw);
+            }
+        }
+        #[cfg(feature = "hil")]
+        mavlink::msg_id::HIL_GPS => {
+            // GPS 真值（HIL_GPS(113)）：与 SET_POSITION 设定点解耦。PC 把物理引擎
+            // 真实 NED 位置/速度经 lat/lon/alt(·1e7/·1e3) 与 vn/ve/vd(·1e2) 缩放装入，
+            // 这里按同一缩放还原。EKF 融合真实位置（update_pos）+ Doppler 速度
+            // （update_vel），才能正确跟踪爬升/位移并让位置环有真实误差可修。
+            if let Some((_t, _fix, lat, lon, alt, _eph, _epv, _vel, vn, ve, vd, _cog, _sat))
+                = mavlink::decode_hil_gps(payload)
+            {
+                use flyctrl_core::units::{Meter, MeterPerSecond};
+                unsafe {
+                    G_HIL_GPS = Some(PosSample::with_vel(
+                        [Meter(lat as f32 * 1e-7), Meter(lon as f32 * 1e-7), Meter(alt as f32 * 1e-3)],
+                        [MeterPerSecond(vn as f32 * 1e-2), MeterPerSecond(ve as f32 * 1e-2), MeterPerSecond(vd as f32 * 1e-2)],
+                    ));
+                }
+                hil_write_sensor_frame();
             }
         }
         _ => {
@@ -831,11 +862,11 @@ pub extern "C" fn uplink_task(_arg: *mut c_void) {
         // 低频存活日志（约每 10s 一次），用于联调确认 uplink 任务未卡死。
         loops += 1;
         unsafe { G_APP_TICKS = G_APP_TICKS.wrapping_add(1); }
-        if loops % 1000 == 0 {
+        if loops % 10000 == 0 {
             info!(tag: "uplink", "poll alive loop={}", loops);
         }
 
-        // 让出 CPU 10ms（与下行 20ms 错开），保持非阻塞轮询。
-        msleep(10);
+        // 让出 CPU 1ms（HIL 下保证 RX ring 快速 drain/re-arm，降低 PC 写阻塞）。
+        msleep(1);
     }
 }
