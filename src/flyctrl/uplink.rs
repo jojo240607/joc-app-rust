@@ -193,8 +193,9 @@ static mut G_RC_OVERRIDE_TICK: u32 = 0;
 #[link_section = ".rust_bss"]
 static mut G_APP_TICKS: u32 = 0;
 
-/// App 单调 tick 计数（单位 10ms）。uplink 主循环每轮 +1，control 任务读取判断超时。
-fn app_ticks() -> u32 {
+/// App 单调 tick 计数（单位 10ms）。uplink 主循环每轮 +1，control 任务读取判断超时 /
+/// HIL 会话 gap 检测。
+pub fn app_ticks() -> u32 {
     unsafe { G_APP_TICKS }
 }
 

@@ -30,6 +30,13 @@ const VERBOSE: bool = false;
 use crate::flyctrl::HIL_EVT;
 use crate::flyctrl::{make_name, EST_MTX, EST_STATE, SENSOR_FRAME, SENSOR_SEQ};
 
+/// HIL 会话 gap 阈值（App 单调 ticks，1 tick≈10ms）：相邻两拍 HIL 帧间隔超过
+/// 该值即判定为全新会话（正常注入 ~32ms/帧 ≈ 3~4 ticks；会话断开→重连间隔 ≥ ~1s
+/// ≈ 100 ticks）。检测到新会话时在首拍前重置估计器/控制器/门控/滤波器，避免继承
+/// 上一会话残留状态导致开局发散。
+#[cfg(feature = "hil")]
+const HIL_SESSION_GAP_TICKS: u32 = 50;
+
 /// 上行指令解锁：地面站经 COMMAND_LONG(ARM/DISARM) 设置。
 /// 与控制律内部 RC 解锁做逻辑或（任一为真即解锁）。
 pub fn set_cmd_armed(arm: bool) {
@@ -294,8 +301,27 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // 注入（uplink 写完真值即 `give()`），收到一帧执行一拍 `step_hil`——与 SIL
         // 的"每物理步一拍、读最新样本"推模式 1:1 对齐，消除双时钟失配导致的输入流
         // 差异（93.2% 控制拍缺 IMU 回退陈旧数据 → 姿态发散）。非 HIL 保持 4ms 周期轮询。
+        //
+        // 【HIL 会话重启自动复位】等待前后各读一次 App 单调 tick，计算相邻两拍
+        // 帧间隔：超过 `HIL_SESSION_GAP_TICKS` 说明上一会话已断开、本拍是全新会话的
+        // 首帧 → 重置估计器/控制器/门控/滤波器（`reset_session`），并清掉本任务持有
+        // 的高度基准/设定点残留，从干净状态开始。否则 MCU 跨会话继承旧 EKF/控制器
+        // 状态，新会话从干净真值注入时立即打转（实测：同脚本未复位 MCU 上发散，
+        // 复位后稳定）。
         #[cfg(feature = "hil")]
-        unsafe { HIL_EVT.wait(); }
+        {
+            let before = crate::flyctrl::uplink::app_ticks();
+            unsafe { HIL_EVT.wait(); }
+            let gap = crate::flyctrl::uplink::app_ticks().wrapping_sub(before);
+            if gap >= HIL_SESSION_GAP_TICKS {
+                hil.reset_session();
+                sim_imu = SimImu::new();
+                hold_alt = Meter(0.0);
+                alt_locked = false;
+                last_est = None;
+                info!(tag: "ctrl", "new HIL session (gap={} ticks) -> reset est/ctrl/gates/filters", gap);
+            }
+        }
         #[cfg(not(feature = "hil"))]
         msleep(4);
         if VERBOSE && seq < 5 {
